@@ -1,0 +1,11 @@
+__pycache__
+venv\*
+.vs
+.vs\*
+/weights
+/venv
+/temp
+/tmp
+/trimesh
+/temp_api
+venv
