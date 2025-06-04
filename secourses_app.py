@@ -154,7 +154,16 @@ padding_param :int =2 )->trimesh .Trimesh :
     input_normals_orig =np .ascontiguousarray (vertex_normals_from_trimesh ,dtype =np .float32 )
 
     print (f"  Input mesh: {input_vertices_orig.shape[0]} vertices, {input_faces_orig.shape[0]} faces.")
-    print (f"  Expected processing time: ~{input_faces_orig.shape[0] / 50000:.1f}-{input_faces_orig.shape[0] / 20000:.1f} seconds (estimate based on mesh complexity)")
+    
+    # Calculate time estimates based on mesh complexity
+    face_count = input_faces_orig.shape[0]
+    # More refined estimates based on observed performance
+    min_time_estimate = face_count / 50000  # Optimistic estimate (50k faces/sec)
+    max_time_estimate = face_count / 15000  # Conservative estimate (15k faces/sec)
+    avg_time_estimate = face_count / 25000  # Average estimate (25k faces/sec)
+    
+    print (f"  Expected processing time: {min_time_estimate:.1f}-{max_time_estimate:.1f}s (avg: {avg_time_estimate:.1f}s)")
+    print (f"  Complexity level: {'Low' if face_count < 100000 else 'Medium' if face_count < 500000 else 'High'} ({face_count:,} faces)")
     sys.stdout.flush()
 
     # Phase 1: Atlas setup
@@ -182,35 +191,28 @@ padding_param :int =2 )->trimesh .Trimesh :
 
     # Phase 3: Atlas generation (the time-consuming part)
     print ("  Phase 3/4: Running xatlas.generate() - This is the time-consuming step...")
-    print ("    -> Please wait, processing mesh charts and UV packing...")
+    print ("    -> Processing mesh charts and UV packing...")
+    print (f"    -> This may take some time so patiently wait for {face_count:,} faces")
+    print ("    -> xatlas will now run without progress updates (this is normal)")
+    print ("    -> Please wait... processing is happening in the background")
+    sys.stdout.flush()
+    
     generation_start = time.time()
     
-    # Simulate progress by showing a simple counter (since xatlas doesn't provide callbacks)
-    import threading
-    import time as time_module
-    
-    generation_complete = threading.Event()
-    
-    def progress_indicator():
-        counter = 0
-        while not generation_complete.is_set():
-            elapsed = time_module.time() - generation_start
-            dots = "." * (counter % 4)
-            print(f"\r    -> Processing{dots:<3} (elapsed: {elapsed:.1f}s)", end="", flush=True)
-            counter += 1
-            generation_complete.wait(1.0)
-        print()  # New line after progress indicator
-    
-    progress_thread = threading.Thread(target=progress_indicator, daemon=True)
-    progress_thread.start()
-    
+    # Just run xatlas.generate() directly - it's a blocking call
     try:
-        atlas .generate (chart_options =chart_options ,pack_options =pack_options )
-    finally:
-        generation_complete.set()
-        progress_thread.join(timeout=1.0)
+        print ("    -> Starting xatlas.generate()...")
+        sys.stdout.flush()
+        atlas.generate(chart_options=chart_options, pack_options=pack_options)
+        generation_time = time.time() - generation_start
+        actual_performance = face_count / generation_time if generation_time > 0 else 0
+        print (f"    -> ✓ xatlas.generate() completed successfully in {generation_time:.2f}s")
+        print (f"    -> Actual performance: {actual_performance:.0f} faces/second")
+    except Exception as e:
+        generation_time = time.time() - generation_start
+        print (f"    -> ✗ xatlas.generate() failed after {generation_time:.2f}s: {e}")
+        raise
     
-    generation_time = time.time() - generation_start
     print (f"  Phase 3/4: Complete ({generation_time:.2f}s)")
     print (f"    -> xatlas generated atlas with dimensions: width={atlas.width}, height={atlas.height}")
     sys.stdout.flush()
@@ -268,6 +270,7 @@ padding_param :int =2 )->trimesh .Trimesh :
     total_time = time.time() - start_time
     print (f"UV Unwrapping with xatlas: Process complete! Total time: {total_time:.2f}s")
     print (f"  -> Performance: {input_faces_orig.shape[0] / total_time:.0f} faces/second")
+    print (f"  -> Efficiency: {(avg_time_estimate / total_time * 100):.1f}% of estimated average time")
     sys.stdout.flush()
     
     return output_mesh
