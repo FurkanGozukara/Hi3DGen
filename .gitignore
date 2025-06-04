@@ -9,3 +9,4 @@ venv\*
 /trimesh
 /temp_api
 venv
+.gradio

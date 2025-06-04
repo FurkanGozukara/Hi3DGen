@@ -142,7 +142,11 @@ normal_seam_weight_param :float =1.0 ,
 resolution_param :int =1024 ,
 padding_param :int =2 )->trimesh .Trimesh :
 
+    import time
+    import sys
+    
     print ("UV Unwrapping with xatlas: Starting process...")
+    start_time = time.time()
 
     input_vertices_orig =input_mesh .vertices .astype (np .float32 )
     input_faces_orig =input_mesh .faces .astype (np .uint32 )
@@ -150,25 +154,73 @@ padding_param :int =2 )->trimesh .Trimesh :
     input_normals_orig =np .ascontiguousarray (vertex_normals_from_trimesh ,dtype =np .float32 )
 
     print (f"  Input mesh: {input_vertices_orig.shape[0]} vertices, {input_faces_orig.shape[0]} faces.")
+    print (f"  Expected processing time: ~{input_faces_orig.shape[0] / 50000:.1f}-{input_faces_orig.shape[0] / 20000:.1f} seconds (estimate based on mesh complexity)")
+    sys.stdout.flush()
 
+    # Phase 1: Atlas setup
+    print ("  Phase 1/4: Setting up xatlas Atlas...")
+    phase_start = time.time()
     atlas =xatlas .Atlas ()
     atlas .add_mesh (input_vertices_orig ,input_faces_orig ,input_normals_orig )
+    print (f"  Phase 1/4: Complete ({time.time() - phase_start:.2f}s)")
+    sys.stdout.flush()
 
+    # Phase 2: Configuration
+    print ("  Phase 2/4: Configuring xatlas options...")
+    phase_start = time.time()
     chart_options =xatlas .ChartOptions ()
-
     chart_options .max_cost =max_cost_param 
-
     chart_options .normal_seam_weight =normal_seam_weight_param 
 
     pack_options =xatlas .PackOptions ()
     pack_options .resolution =resolution_param 
     pack_options .padding =padding_param 
+    print (f"  Phase 2/4: Complete ({time.time() - phase_start:.2f}s)")
+    print (f"    -> ChartOptions: max_cost={chart_options.max_cost:.2f}, normal_seam_weight={chart_options.normal_seam_weight:.2f}")
+    print (f"    -> PackOptions: resolution={pack_options.resolution}, padding={pack_options.padding}")
+    sys.stdout.flush()
 
-    print (f"  Running xatlas.generate() with ChartOptions(max_cost={chart_options.max_cost:.2f}, normal_seam_weight={chart_options.normal_seam_weight:.2f}) and PackOptions(resolution={pack_options.resolution}, padding={pack_options.padding})...")
-    atlas .generate (chart_options =chart_options ,pack_options =pack_options )
-    print (f"  xatlas generated atlas with dimensions: width={atlas.width}, height={atlas.height}")
+    # Phase 3: Atlas generation (the time-consuming part)
+    print ("  Phase 3/4: Running xatlas.generate() - This is the time-consuming step...")
+    print ("    -> Please wait, processing mesh charts and UV packing...")
+    generation_start = time.time()
+    
+    # Simulate progress by showing a simple counter (since xatlas doesn't provide callbacks)
+    import threading
+    import time as time_module
+    
+    generation_complete = threading.Event()
+    
+    def progress_indicator():
+        counter = 0
+        while not generation_complete.is_set():
+            elapsed = time_module.time() - generation_start
+            dots = "." * (counter % 4)
+            print(f"\r    -> Processing{dots:<3} (elapsed: {elapsed:.1f}s)", end="", flush=True)
+            counter += 1
+            generation_complete.wait(1.0)
+        print()  # New line after progress indicator
+    
+    progress_thread = threading.Thread(target=progress_indicator, daemon=True)
+    progress_thread.start()
+    
+    try:
+        atlas .generate (chart_options =chart_options ,pack_options =pack_options )
+    finally:
+        generation_complete.set()
+        progress_thread.join(timeout=1.0)
+    
+    generation_time = time.time() - generation_start
+    print (f"  Phase 3/4: Complete ({generation_time:.2f}s)")
+    print (f"    -> xatlas generated atlas with dimensions: width={atlas.width}, height={atlas.height}")
+    sys.stdout.flush()
 
+    # Phase 4: Processing results
+    print ("  Phase 4/4: Processing xatlas results...")
+    phase_start = time.time()
+    
     v_out_xref_data ,f_out_indices ,uv_coords_from_xatlas =atlas .get_mesh (0 )
+    print (f"    -> Retrieved mesh data: {uv_coords_from_xatlas.shape[0]} UV vertices, {f_out_indices.shape[0]} faces")
 
     num_new_vertices =uv_coords_from_xatlas .shape [0 ]
     if v_out_xref_data .shape ==(num_new_vertices ,):
@@ -177,23 +229,26 @@ padding_param :int =2 )->trimesh .Trimesh :
              raise ValueError ("Invalid xref values from xatlas - out of bounds for original input vertices.")
         final_vertices_spatial =input_vertices_orig [xref_indices ]
     elif v_out_xref_data .shape ==(num_new_vertices ,3 ):
-        print ("  Warning: xatlas.get_mesh() returned 3D vertex data directly, which is unexpected for add_mesh workflow.")
+        print ("    -> Warning: xatlas.get_mesh() returned 3D vertex data directly, which is unexpected for add_mesh workflow.")
         final_vertices_spatial =v_out_xref_data .astype (np .float32 )
     else :
         raise ValueError (f"Unexpected shape for vertex/xref data from xatlas.get_mesh: {v_out_xref_data.shape}.")
 
+    print (f"    -> Processed vertex mapping: {final_vertices_spatial.shape[0]} final vertices")
+
     final_uvs =uv_coords_from_xatlas .astype (np .float32 )
     if np .any (final_uvs >1.5 ):
-        print ("  UVs appear to be in pixel coordinates. Normalizing...")
+        print ("    -> UVs appear to be in pixel coordinates. Normalizing...")
         if atlas .width >0 and atlas .height >0 :
             final_uvs /=np .array ([atlas .width ,atlas .height ],dtype =np .float32 )
         else :
-            print ("  WARNING: Atlas width/height is 0, cannot normalize pixel UVs. Using unnormalized.")
+            print ("    -> WARNING: Atlas width/height is 0, cannot normalize pixel UVs. Using unnormalized.")
     else :
         min_uv =final_uvs .min (axis =0 )if final_uvs .size >0 else "N/A"
         max_uv =final_uvs .max (axis =0 )if final_uvs .size >0 else "N/A"
-        print (f"  UVs appear to be normalized. Min: {min_uv}, Max: {max_uv}")
+        print (f"    -> UVs appear to be normalized. Min: {min_uv}, Max: {max_uv}")
 
+    print (f"    -> Creating final Trimesh object...")
     output_mesh =trimesh .Trimesh (vertices =final_vertices_spatial ,faces =f_out_indices ,process =False )
 
     if final_uvs .shape !=(final_vertices_spatial .shape [0 ],2 ):
@@ -203,13 +258,19 @@ padding_param :int =2 )->trimesh .Trimesh :
     output_mesh .visual =trimesh .visual .TextureVisuals (uv =final_uvs ,material =material )
 
     if hasattr (output_mesh .visual ,'uv')and output_mesh .visual .uv is not None :
-        print (f"  Trimesh object successfully created with UVs, Shape: {output_mesh.visual.uv.shape}")
+        print (f"    -> Trimesh object successfully created with UVs, Shape: {output_mesh.visual.uv.shape}")
     else :
-        print ("  ERROR: Trimesh object does NOT have UVs assigned after TextureVisuals call.")
+        print ("    -> ERROR: Trimesh object does NOT have UVs assigned after TextureVisuals call.")
         raise RuntimeError ("Failed to assign UVs to the Trimesh object.")
 
-    print ("UV Unwrapping with xatlas: Process complete.")
-    return output_mesh 
+    print (f"  Phase 4/4: Complete ({time.time() - phase_start:.2f}s)")
+    
+    total_time = time.time() - start_time
+    print (f"UV Unwrapping with xatlas: Process complete! Total time: {total_time:.2f}s")
+    print (f"  -> Performance: {input_faces_orig.shape[0] / total_time:.0f} faces/second")
+    sys.stdout.flush()
+    
+    return output_mesh
 
 def generate_3d (image ,seed =-1 ,
 ss_guidance_strength =3 ,ss_sampling_steps =50 ,
@@ -297,16 +358,24 @@ normal_match_input_resolution :bool =True ):
 
     pipeline_on_gpu =False 
     try :
+        import time
+        import sys
+        generation_start_time = time.time()
+        
         if torch .cuda .is_available ():
             print ("3D Generation: Moving Hi3DGen pipeline to GPU...")
             hi3dgen_pipeline .cuda ();pipeline_on_gpu =True 
 
         print ("3D Generation: Running Hi3DGen pipeline...")
+        pipeline_start = time.time()
         outputs =hi3dgen_pipeline .run (
         normal_image_pil ,seed =seed ,formats =["mesh",],preprocess_image =False ,
         sparse_structure_sampler_params ={"steps":ss_sampling_steps ,"cfg_strength":ss_guidance_strength },
         slat_sampler_params ={"steps":slat_sampling_steps ,"cfg_strength":slat_guidance_strength },
         )
+        pipeline_time = time.time() - pipeline_start
+        print (f"3D Generation: Hi3DGen pipeline completed in {pipeline_time:.2f}s")
+        sys.stdout.flush()
 
         timestamp =datetime .datetime .now ().strftime ('%Y%m%d%H%M%S')
         output_dir =os .path .join (TMP_DIR ,timestamp )
@@ -314,8 +383,13 @@ normal_match_input_resolution :bool =True ):
 
         mesh_path_glb =os .path .join (output_dir ,"mesh.glb")
 
+        print ("Mesh Processing: Converting to Trimesh and simplifying...")
+        mesh_start = time.time()
         raw_mesh_trimesh =outputs ['mesh'][0 ].to_trimesh (transform_pose =True )
         mesh_for_uv_unwrap =simplify_mesh_open3d (raw_mesh_trimesh ,poly_count_pcnt )
+        mesh_processing_time = time.time() - mesh_start
+        print (f"Mesh Processing: Completed in {mesh_processing_time:.2f}s")
+        sys.stdout.flush()
 
         unwrapped_mesh_trimesh =unwrap_mesh_with_xatlas (mesh_for_uv_unwrap ,
         max_cost_param =xatlas_max_cost ,
@@ -323,9 +397,21 @@ normal_match_input_resolution :bool =True ):
         resolution_param =xatlas_resolution ,
         padding_param =xatlas_padding )
 
-        print (f"Exporting GLB to {mesh_path_glb}...")
+        print (f"File Export: Exporting GLB to {mesh_path_glb}...")
+        export_start = time.time()
         unwrapped_mesh_trimesh .export (mesh_path_glb )
-        print (f"SUCCESS: GLB exported.")
+        export_time = time.time() - export_start
+        print (f"File Export: GLB exported successfully in {export_time:.2f}s")
+        
+        total_generation_time = time.time() - generation_start_time
+        print (f"=== GENERATION COMPLETE ===")
+        print (f"Total time breakdown:")
+        print (f"  - Hi3DGen pipeline: {pipeline_time:.2f}s ({pipeline_time/total_generation_time*100:.1f}%)")
+        print (f"  - Mesh processing: {mesh_processing_time:.2f}s ({mesh_processing_time/total_generation_time*100:.1f}%)")
+        print (f"  - UV Unwrapping: (see detailed breakdown above)")
+        print (f"  - File export: {export_time:.2f}s ({export_time/total_generation_time*100:.1f}%)")
+        print (f"  - TOTAL: {total_generation_time:.2f}s")
+        sys.stdout.flush()
 
         gradio_model_path =mesh_path_glb 
 
