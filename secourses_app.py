@@ -13,7 +13,8 @@ import hf_transfer
 import trimesh 
 import open3d as o3d 
 import xatlas 
-import argparse 
+import argparse
+from logic.auto_save import auto_save_generation, open_outputs_folder 
 
 MAX_SEED =np .iinfo (np .int32 ).max 
 TMP_DIR =os .path .join (os .path .dirname (os .path .abspath (__file__ )),'tmp')
@@ -284,7 +285,11 @@ xatlas_normal_seam_weight :float =1.0 ,
 xatlas_resolution :int =1024 ,
 xatlas_padding :int =2 ,
 normal_map_resolution :int =768 ,
-normal_match_input_resolution :bool =True ):
+normal_match_input_resolution :bool =True ,
+auto_save_obj :bool =True ,
+auto_save_glb :bool =True ,
+auto_save_ply :bool =True ,
+auto_save_stl :bool =True ):
 
     if image is None :
         print ("Input image is None. Aborting generation.")
@@ -428,6 +433,33 @@ normal_match_input_resolution :bool =True ):
             hi3dgen_pipeline .cpu ()
             if torch .cuda .is_available ():torch .cuda .empty_cache ()
 
+    # Auto-save logic
+    if gradio_model_path and (auto_save_obj or auto_save_glb or auto_save_ply or auto_save_stl):
+        try:
+            enabled_formats = {
+                "obj": auto_save_obj,
+                "glb": auto_save_glb,
+                "ply": auto_save_ply,
+                "stl": auto_save_stl
+            }
+            
+            print("Starting auto-save process...")
+            auto_save_result = auto_save_generation(
+                mesh_path=gradio_model_path,
+                normal_image=normal_image_pil,
+                enabled_formats=enabled_formats
+            )
+            
+            if auto_save_result:
+                print(f"✓ Auto-save successful: Saved to folder {auto_save_result['folder_number']}")
+                print(f"  Saved {len(auto_save_result['saved_files'])} files")
+            else:
+                print("✗ Auto-save failed")
+                
+        except Exception as e:
+            print(f"Auto-save error: {e}")
+            traceback.print_exc()
+
     return normal_image_pil ,gradio_model_path ,gradio_model_path 
 
 def convert_mesh (mesh_path :str ,export_format :str )->Optional [str ]:
@@ -478,7 +510,7 @@ def convert_mesh (mesh_path :str ,export_format :str )->Optional [str ]:
 
 with gr .Blocks (css ="footer {visibility: hidden}",theme =gr .themes .Soft ())as demo :
     gr .Markdown (
-    "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V1 : https://www.patreon.com/posts/123105403"
+    "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V1.1 with Auto-Save : https://www.patreon.com/posts/123105403"
     )
 
     with gr .Row ():
@@ -560,6 +592,18 @@ with gr .Blocks (css ="footer {visibility: hidden}",theme =gr .themes .Soft ())a
                 label ="File Format"
                 )
                 download_btn =gr .DownloadButton (label ="Export Mesh",interactive =False )
+                
+                # Open outputs folder button
+                open_folder_btn = gr.Button("📁 Open Outputs Folder", variant="primary")
+                
+                # Auto-save checkboxes
+                gr.Markdown("#### Auto-Save Settings")
+                with gr.Row():
+                    auto_save_obj_cb = gr.Checkbox(value=True, label="Auto-save OBJ", info="Wavefront OBJ format")
+                    auto_save_glb_cb = gr.Checkbox(value=True, label="Auto-save GLB", info="Binary glTF format")
+                with gr.Row():
+                    auto_save_ply_cb = gr.Checkbox(value=True, label="Auto-save PLY", info="Stanford Triangle format")  
+                    auto_save_stl_cb = gr.Checkbox(value=True, label="Auto-save STL", info="Stereolithography format")
             with gr .Column ():
                 examples =gr .Examples (
                 examples =[
@@ -588,7 +632,11 @@ with gr .Blocks (css ="footer {visibility: hidden}",theme =gr .themes .Soft ())a
     xatlas_resolution_slider ,
     xatlas_padding_slider ,
     normal_map_resolution_slider ,
-    normal_match_input_res_checkbox 
+    normal_match_input_res_checkbox ,
+    auto_save_obj_cb ,
+    auto_save_glb_cb ,
+    auto_save_ply_cb ,
+    auto_save_stl_cb 
     ],
     outputs =[normal_output ,model_output ,download_btn ]
     ).then (
@@ -638,6 +686,13 @@ with gr .Blocks (css ="footer {visibility: hidden}",theme =gr .themes .Soft ())a
     update_download_button ,
     inputs =[model_output ,export_format ],
     outputs =[download_btn ]
+    )
+    
+    # Open outputs folder button click handler
+    open_folder_btn.click(
+        fn=lambda: open_outputs_folder(),
+        inputs=[],
+        outputs=[]
     )
 
 if __name__ =="__main__":

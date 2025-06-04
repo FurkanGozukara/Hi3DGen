@@ -10,3 +10,4 @@ venv\*
 /temp_api
 venv
 .gradio
+outputs
