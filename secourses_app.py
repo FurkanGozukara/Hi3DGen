@@ -14,7 +14,8 @@ import trimesh
 import open3d as o3d 
 import xatlas 
 import argparse
-from logic.auto_save import auto_save_generation, open_outputs_folder 
+from logic.auto_save import auto_save_generation, open_outputs_folder
+from logic.parameter_info import format_parameter_info_html 
 
 MAX_SEED =np .iinfo (np .int32 ).max 
 TMP_DIR =os .path .join (os .path .dirname (os .path .abspath (__file__ )),'tmp')
@@ -508,7 +509,26 @@ def convert_mesh (mesh_path :str ,export_format :str )->Optional [str ]:
                 print (f"convert_mesh: Error removing temp file {temp_file_path}: {rm_e}")
         return None 
 
-with gr .Blocks (css ="footer {visibility: hidden}",theme =gr .themes .Soft ())as demo :
+custom_css = """
+footer {visibility: hidden}
+#parameter-guide-content {
+    width: 100% !important;
+    height: 80vh !important;
+    max-width: none !important;
+    max-height: none !important;
+}
+#parameter-guide-content > div {
+    width: 100% !important;
+    height: 100% !important;
+    max-width: none !important;
+}
+.parameter-guide-tab {
+    width: 100% !important;
+    height: 100% !important;
+}
+"""
+
+with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     gr .Markdown (
     "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V1.1 with Auto-Save : https://www.patreon.com/posts/123105403"
     )
@@ -526,6 +546,15 @@ with gr .Blocks (css ="footer {visibility: hidden}",theme =gr .themes .Soft ())a
 
                 with gr .Tab ("Multiple Images"):
                     gr .Markdown ("<div style='text-align: center; padding: 40px; font-size: 24px;'>Multiple Images functionality is coming soon!</div>")
+
+                with gr .Tab ("📋 Parameter Guide"):
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            parameter_info_html = gr .HTML (
+                                value =format_parameter_info_html (),
+                                show_label =False ,
+                                elem_id ="parameter-guide-content"
+                            )
 
             with gr .Accordion ("Advanced Settings",open =True ):
                 seed =gr .Slider (-1 ,MAX_SEED ,label ="Seed",value =0 ,step =1 )
