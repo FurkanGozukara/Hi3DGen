@@ -347,11 +347,14 @@ def convert_mesh (mesh_path :str ,export_format :str )->Optional [str ]:
         print (f"convert_mesh: Invalid input mesh_path: {mesh_path}")
         return None 
 
-    temp_file_path =None 
     try :
-
-        with trimesh .util .NamedTemporaryFile (suffix =f".{export_format.lower()}",delete =False )as tmp_out_file_obj :
-            temp_file_path =tmp_out_file_obj .name 
+        # Create a predictable filename for better download behavior
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"mesh_{timestamp}.{export_format.lower()}"
+        temp_file_path = os.path.join(TMP_DIR, filename)
+        
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(temp_file_path), exist_ok=True)
 
         if export_format .lower ()=="glb"and mesh_path .lower ().endswith (".glb"):
             print (f"convert_mesh: Copying GLB {mesh_path} to {temp_file_path}")
@@ -364,14 +367,20 @@ def convert_mesh (mesh_path :str ,export_format :str )->Optional [str ]:
         if not (hasattr (mesh .visual ,'uv')and mesh .visual .uv is not None ):
             print (f"  Warning: Loaded mesh from {mesh_path} has no UVs before export to {export_format}.")
 
+        # Export the mesh with explicit file type
         mesh .export (temp_file_path ,file_type =export_format .lower ())
+        
+        # Verify the file was created and has content
+        if not os.path.exists(temp_file_path) or os.path.getsize(temp_file_path) == 0:
+            raise Exception(f"Failed to create valid {export_format} file")
 
+        print (f"convert_mesh: Successfully created {export_format} file at {temp_file_path} ({os.path.getsize(temp_file_path)} bytes)")
         return temp_file_path 
 
     except Exception as e :
         print (f"convert_mesh: Error during conversion of '{mesh_path}' to '{export_format}': {e}")
         traceback .print_exc ()
-        if temp_file_path and os .path .exists (temp_file_path ):
+        if 'temp_file_path' in locals() and temp_file_path and os .path .exists (temp_file_path ):
             try :
                 os .remove (temp_file_path )
             except Exception as rm_e :
@@ -498,21 +507,43 @@ with gr .Blocks (css ="footer {visibility: hidden}",theme =gr .themes .Soft ())a
     outputs =[download_btn ],
     )
 
+    def prepare_download_file(mesh_path_from_model_output: str, selected_format: str):
+        """Prepare file for download with proper naming"""
+        if not mesh_path_from_model_output:
+            return None
+            
+        converted_path = convert_mesh(mesh_path_from_model_output, selected_format)
+        if not converted_path:
+            return None
+            
+        # Create a final file with a clean name for download
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        final_filename = f"generated_mesh_{timestamp}.{selected_format.lower()}"
+        final_path = os.path.join(TMP_DIR, final_filename)
+        
+        try:
+            shutil.copy2(converted_path, final_path)
+            print(f"prepare_download_file: Created download file {final_path}")
+            return final_path
+        except Exception as e:
+            print(f"prepare_download_file: Error creating final download file: {e}")
+            return converted_path  # Fallback to original converted file
+
     def update_download_button (mesh_path_from_model_output :str ,selected_format :str ):
 
         if not mesh_path_from_model_output :
 
-            return gr .DownloadButton .update (interactive =False )
+            return gr .DownloadButton (interactive =False, label="Export Mesh")
 
-        path_for_download =convert_mesh (mesh_path_from_model_output ,selected_format )
+        path_for_download = prepare_download_file(mesh_path_from_model_output, selected_format)
 
         if path_for_download :
             print (f"update_download_button: Providing {path_for_download} for download as {selected_format}.")
-
-            return gr .DownloadButton .update (value =path_for_download ,interactive =True )
+            # Ensure the file has the right extension for the download name
+            return gr .DownloadButton (value =path_for_download ,interactive =True, label=f"Download {selected_format.upper()}")
         else :
             print (f"update_download_button: Conversion failed for {selected_format}, button inactive.")
-            return gr .DownloadButton .update (interactive =False )
+            return gr .DownloadButton (interactive =False, label="Export Mesh")
 
     export_format .change (
     update_download_button ,
