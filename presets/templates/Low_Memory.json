@@ -1,0 +1,24 @@
+{
+  "name": "Low_Memory",
+  "created_at": "2025-06-05T14:22:25.934689",
+  "description": "Settings optimized for systems with limited GPU memory",
+  "version": "1.0",
+  "parameters": {
+    "seed": -1,
+    "ss_guidance_strength": 2.5,
+    "ss_sampling_steps": 30,
+    "slat_guidance_strength": 2.5,
+    "slat_sampling_steps": 4,
+    "poly_count_pcnt": 0.4,
+    "xatlas_max_cost": 9.0,
+    "xatlas_normal_seam_weight": 1.2,
+    "xatlas_resolution": 512,
+    "xatlas_padding": 1,
+    "normal_map_resolution": 512,
+    "normal_match_input_resolution": false,
+    "auto_save_obj": true,
+    "auto_save_glb": true,
+    "auto_save_ply": true,
+    "auto_save_stl": true
+  }
+}

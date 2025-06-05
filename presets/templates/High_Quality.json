@@ -1,0 +1,24 @@
+{
+  "name": "High_Quality",
+  "created_at": "2025-06-05T14:22:25.932682",
+  "description": "High quality settings for detailed 3D models (slower processing)",
+  "version": "1.0",
+  "parameters": {
+    "seed": -1,
+    "ss_guidance_strength": 4.0,
+    "ss_sampling_steps": 50,
+    "slat_guidance_strength": 4.0,
+    "slat_sampling_steps": 8,
+    "poly_count_pcnt": 0.8,
+    "xatlas_max_cost": 6.0,
+    "xatlas_normal_seam_weight": 0.8,
+    "xatlas_resolution": 2048,
+    "xatlas_padding": 4,
+    "normal_map_resolution": 1024,
+    "normal_match_input_resolution": true,
+    "auto_save_obj": true,
+    "auto_save_glb": true,
+    "auto_save_ply": true,
+    "auto_save_stl": true
+  }
+}

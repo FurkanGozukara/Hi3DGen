@@ -24,6 +24,13 @@ get_cancellation_manager ,request_cancellation ,get_status_summary ,
 start_single_processing ,finish_processing ,should_cancel ,
 add_cleanup_callback ,remove_cleanup_callback 
 )
+from logic .preset_manager import (
+save_preset_from_ui ,load_preset_for_ui ,delete_preset_from_ui ,
+initialize_presets_for_ui ,get_preset_choices_for_ui ,
+validate_preset_name ,get_preset_status_for_ui 
+)
+from logic .preset_file_manager import initialize_preset_file_system
+from logic .preset_validation import validate_preset_for_ui ,validate_ui_parameters
 
 try :
     from logic .system_status import get_status_summary as get_comprehensive_status_summary ,print_system_status 
@@ -792,6 +799,40 @@ footer {visibility: hidden}
     50% { opacity: 0.7; }
     100% { opacity: 1; }
 }
+/* Preset Management Styles */
+.preset-management {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border-radius: 8px;
+    padding: 15px;
+    margin: 10px 0;
+    color: white;
+}
+.preset-dropdown {
+    background: white !important;
+    color: black !important;
+}
+.preset-save-btn {
+    background-color: #28a745 !important;
+    border-color: #28a745 !important;
+}
+.preset-load-btn {
+    background-color: #007bff !important;
+    border-color: #007bff !important;
+}
+.preset-delete-btn {
+    background-color: #dc3545 !important;
+    border-color: #dc3545 !important;
+}
+.preset-status-success {
+    background-color: #d4edda !important;
+    border-color: #c3e6cb !important;
+    color: #155724 !important;
+}
+.preset-status-error {
+    background-color: #f8d7da !important;
+    border-color: #f5c6cb !important;
+    color: #721c24 !important;
+}
 /* Enhanced progress display styles */
 .progress-container {
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -824,7 +865,7 @@ footer {visibility: hidden}
 
 with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     gr .Markdown (
-    "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V1.1 with Auto-Save : https://www.patreon.com/posts/123105403"
+    "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V12 with Auto-Save : https://www.patreon.com/posts/130766890"
     )
 
     with gr .Row ():
@@ -993,6 +1034,49 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                 with gr .Row ():
                     auto_save_ply_cb =gr .Checkbox (value =True ,label ="Auto-save PLY",info ="Stanford Triangle format")
                     auto_save_stl_cb =gr .Checkbox (value =True ,label ="Auto-save STL",info ="Stereolithography format")
+                
+                gr .Markdown ("#### 📋 Preset Management")
+                with gr .Row ():
+                    preset_dropdown =gr .Dropdown (
+                        choices =["Default"],
+                        value ="Default",
+                        label ="Current Preset",
+                        info ="Select or load a saved preset",
+                        interactive =True 
+                    )
+                    preset_status_text =gr .Textbox (
+                        value ="📋 Presets: Ready",
+                        label ="Status",
+                        interactive =False ,
+                        scale =2 
+                    )
+                
+                with gr .Row ():
+                    with gr .Column (scale =2 ):
+                        preset_name_input =gr .Textbox (
+                            label ="New Preset Name",
+                            placeholder ="Enter preset name...",
+                            info ="Name for saving current settings"
+                        )
+                    with gr .Column (scale =3 ):
+                        preset_description_input =gr .Textbox (
+                            label ="Description (Optional)",
+                            placeholder ="Describe this preset...",
+                            info ="Optional description for the preset"
+                        )
+                
+                with gr .Row ():
+                    save_preset_btn =gr .Button ("💾 Save Preset",variant ="primary",scale =1 )
+                    load_preset_btn =gr .Button ("📂 Load Preset",variant ="secondary",scale =1 )
+                    delete_preset_btn =gr .Button ("🗑️ Delete",variant ="stop",scale =1 )
+                
+                preset_message_text =gr .Textbox (
+                    value ="Ready to manage presets",
+                    label ="Messages",
+                    interactive =False ,
+                    lines =2 
+                )
+                
             with gr .Column ():
                 examples =gr .Examples (
                 examples =[
@@ -1082,6 +1166,285 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     inputs =[],
     outputs =[]
     )
+
+    # Preset Management Functions
+    def save_preset_ui_handler (preset_name ,preset_description ,
+    seed ,ss_guidance_strength ,ss_sampling_steps ,
+    slat_guidance_strength ,slat_sampling_steps ,poly_count_pcnt ,
+    xatlas_max_cost ,xatlas_normal_seam_weight ,xatlas_resolution ,xatlas_padding ,
+    normal_map_resolution ,normal_match_input_resolution ,
+    auto_save_obj ,auto_save_glb ,auto_save_ply ,auto_save_stl ):
+        """Handle saving a preset from the UI with validation"""
+        try :
+            # Validate preset name
+            is_valid ,validation_message =validate_preset_name (preset_name )
+            if not is_valid :
+                return (
+                gr .Dropdown (choices =get_preset_choices_for_ui ()),# preset_dropdown 
+                f"❌ {validation_message}",# preset_message_text 
+                get_preset_status_for_ui (),# preset_status_text 
+                gr .Textbox (value =""),# clear preset_name_input 
+                gr .Textbox (value ="")# clear preset_description_input 
+                )
+            
+            # Validate parameters before saving
+            try :
+                from logic .preset_validation import validate_ui_parameters 
+                
+                param_validation_result =validate_ui_parameters (
+                seed =seed ,ss_guidance_strength =ss_guidance_strength ,ss_sampling_steps =ss_sampling_steps ,
+                slat_guidance_strength =slat_guidance_strength ,slat_sampling_steps =slat_sampling_steps ,
+                poly_count_pcnt =poly_count_pcnt ,xatlas_max_cost =xatlas_max_cost ,
+                xatlas_normal_seam_weight =xatlas_normal_seam_weight ,xatlas_resolution =xatlas_resolution ,
+                xatlas_padding =xatlas_padding ,normal_map_resolution =normal_map_resolution ,
+                normal_match_input_resolution =normal_match_input_resolution ,
+                auto_save_obj =auto_save_obj ,auto_save_glb =auto_save_glb ,
+                auto_save_ply =auto_save_ply ,auto_save_stl =auto_save_stl 
+                )
+                
+                all_params_valid ,sanitized_values ,param_message =param_validation_result 
+                
+                if not all_params_valid :
+                    print (f"⚠️ Parameter validation warnings: {param_message}")
+                    # Continue with sanitized values but warn user
+                    extra_message =f" (Parameter adjustments: {param_message})"
+                else :
+                    extra_message =""
+                    
+            except ImportError :
+                print ("⚠️ Parameter validation not available")
+                extra_message =""
+            except Exception as validation_error :
+                print (f"⚠️ Parameter validation error: {validation_error}")
+                extra_message =f" (Validation warning: {str(validation_error)})"
+            
+            print (f"💾 Saving preset '{preset_name}' with current parameters...")
+            print (f"   Parameters: seed={seed}, ss_guidance={ss_guidance_strength}, poly%={poly_count_pcnt:.2f}")
+            
+            # Save preset
+            success ,message ,updated_presets ,selected_preset =save_preset_from_ui (
+            preset_name ,preset_description ,
+            seed ,ss_guidance_strength ,ss_sampling_steps ,
+            slat_guidance_strength ,slat_sampling_steps ,poly_count_pcnt ,
+            xatlas_max_cost ,xatlas_normal_seam_weight ,xatlas_resolution ,xatlas_padding ,
+            normal_map_resolution ,normal_match_input_resolution ,
+            auto_save_obj ,auto_save_glb ,auto_save_ply ,auto_save_stl ,
+            overwrite =False # For now, don't allow overwrite without confirmation
+            )
+            
+            if success :
+                status_msg =f"✅ {message}{extra_message}"
+                clear_inputs =True 
+                print (f"✅ Preset '{preset_name}' saved successfully")
+            else :
+                status_msg =f"❌ {message}"
+                clear_inputs =False 
+                print (f"❌ Failed to save preset '{preset_name}': {message}")
+            
+            return (
+            gr .Dropdown (choices =updated_presets ,value =selected_preset ),# preset_dropdown 
+            status_msg ,# preset_message_text 
+            get_preset_status_for_ui (),# preset_status_text 
+            gr .Textbox (value =""if clear_inputs else preset_name ),# preset_name_input 
+            gr .Textbox (value =""if clear_inputs else preset_description )# preset_description_input 
+            )
+            
+        except Exception as e :
+            error_msg =f"Error saving preset: {str(e)}"
+            print (f"❌ {error_msg}")
+            import traceback 
+            traceback .print_exc ()
+            
+            return (
+            gr .Dropdown (choices =get_preset_choices_for_ui ()),# preset_dropdown 
+            f"❌ {error_msg}",# preset_message_text 
+            "❌ Error in preset system",# preset_status_text 
+            gr .Textbox (value =preset_name ),# preset_name_input 
+            gr .Textbox (value =preset_description )# preset_description_input 
+            )
+
+    def load_preset_ui_handler (selected_preset ):
+        """Handle loading a preset from the UI with enhanced feedback"""
+        try :
+            # Check if preset is selected
+            if not selected_preset or selected_preset .strip ()=="":
+                return (
+                gr .Dropdown (choices =get_preset_choices_for_ui ()),
+                "⚠️ No preset selected",
+                get_preset_status_for_ui (),
+                # Keep current parameter values (no change)
+                gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),
+                gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),
+                gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),gr .update ()
+                )
+            
+            print (f"🔄 Loading preset '{selected_preset}'...")
+            
+            success ,message ,updated_presets ,current_preset ,ui_values =load_preset_for_ui (selected_preset )
+            
+            if success :
+                # Format success message with parameter info
+                param_info =f"Parameters: seed={ui_values[0]}, quality={ui_values[1]:.1f}"
+                status_msg =f"✅ {message}"
+                print (f"✅ Loaded preset '{selected_preset}' successfully ({param_info})")
+                
+                # Log parameter changes for debugging
+                print (f"   Applied parameters:")
+                print (f"     Seed: {ui_values[0]}")
+                print (f"     SS Guidance: {ui_values[1]}, Steps: {ui_values[2]}")
+                print (f"     SLAT Guidance: {ui_values[3]}, Steps: {ui_values[4]}")
+                print (f"     Polygon %: {ui_values[5]:.2f}")
+                print (f"     UV Resolution: {ui_values[8]}")
+                
+            else :
+                status_msg =f"❌ {message}"
+                print (f"❌ Failed to load preset '{selected_preset}': {message}")
+            
+            # ui_values contains all parameter values in this order:
+            # (seed, ss_guidance_strength, ss_sampling_steps, slat_guidance_strength, slat_sampling_steps,
+            #  poly_count_pcnt, xatlas_max_cost, xatlas_normal_seam_weight, xatlas_resolution, xatlas_padding,
+            #  normal_map_resolution, normal_match_input_resolution, auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl)
+            
+            return (
+            gr .Dropdown (choices =updated_presets ,value =current_preset ),# preset_dropdown 
+            status_msg ,# preset_message_text 
+            get_preset_status_for_ui (),# preset_status_text 
+            # All parameter controls:
+            ui_values [0 ],# seed 
+            ui_values [1 ],# ss_guidance_strength 
+            ui_values [2 ],# ss_sampling_steps 
+            ui_values [3 ],# slat_guidance_strength 
+            ui_values [4 ],# slat_sampling_steps 
+            ui_values [5 ],# poly_count_pcnt 
+            ui_values [6 ],# xatlas_max_cost 
+            ui_values [7 ],# xatlas_normal_seam_weight 
+            ui_values [8 ],# xatlas_resolution 
+            ui_values [9 ],# xatlas_padding 
+            ui_values [10 ],# normal_map_resolution 
+            ui_values [11 ],# normal_match_input_resolution 
+            ui_values [12 ],# auto_save_obj 
+            ui_values [13 ],# auto_save_glb 
+            ui_values [14 ],# auto_save_ply 
+            ui_values [15 ]# auto_save_stl 
+            )
+            
+        except Exception as e :
+            error_msg =f"Error loading preset: {str(e)}"
+            print (f"❌ {error_msg}")
+            import traceback 
+            traceback .print_exc ()
+            
+            # Return current state with error message
+            return (
+            gr .Dropdown (choices =get_preset_choices_for_ui ()),# preset_dropdown 
+            f"❌ {error_msg}",# preset_message_text 
+            "❌ Error in preset system",# preset_status_text 
+            # Keep current parameter values (no change)
+            gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),
+            gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),
+            gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),gr .update ()
+            )
+
+    def delete_preset_ui_handler (selected_preset ):
+        """Handle deleting a preset from the UI"""
+        try :
+            if not selected_preset or selected_preset .strip ()=="":
+                return (
+                gr .Dropdown (choices =get_preset_choices_for_ui ()),
+                "❌ No preset selected for deletion",
+                get_preset_status_for_ui ()
+                )
+            
+            success ,message ,updated_presets ,current_preset =delete_preset_from_ui (selected_preset )
+            
+            if success :
+                status_msg =f"✅ {message}"
+                print (f"✅ Deleted preset '{selected_preset}' successfully")
+            else :
+                status_msg =f"❌ {message}"
+                print (f"❌ Failed to delete preset '{selected_preset}': {message}")
+            
+            return (
+            gr .Dropdown (choices =updated_presets ,value =current_preset ),# preset_dropdown 
+            status_msg ,# preset_message_text 
+            get_preset_status_for_ui ()# preset_status_text 
+            )
+            
+        except Exception as e :
+            error_msg =f"Error deleting preset: {str(e)}"
+            print (f"❌ {error_msg}")
+            import traceback 
+            traceback .print_exc ()
+            
+            return (
+            gr .Dropdown (choices =get_preset_choices_for_ui ()),
+            f"❌ {error_msg}",
+            "❌ Error in preset system"
+            )
+
+    def initialize_preset_ui ():
+        """Initialize preset UI on app startup"""
+        try :
+            print ("🔧 Initializing preset UI...")
+            
+            # Initialize file system first
+            file_success ,file_message =initialize_preset_file_system ()
+            if not file_success :
+                print (f"⚠️ Preset file system initialization failed: {file_message}")
+            
+            # Initialize preset system
+            success ,message ,preset_list ,selected_preset ,ui_values =initialize_presets_for_ui ()
+            
+            if success :
+                status_msg =f"✅ {message}"
+                print (f"✅ Preset system initialized: {len(preset_list)} presets available")
+            else :
+                status_msg =f"❌ {message}"
+                print (f"❌ Preset system initialization failed: {message}")
+                # Use fallback values
+                preset_list =["Default"]
+                selected_preset ="Default"
+                ui_values =(
+                -1 ,3.0 ,50 ,3.0 ,6 ,0.5 ,8.0 ,1.0 ,1024 ,2 ,768 ,True ,True ,True ,True ,True 
+                )
+            
+            return (
+            gr .Dropdown (choices =preset_list ,value =selected_preset ),# preset_dropdown 
+            f"Preset system ready",# preset_message_text 
+            get_preset_status_for_ui (),# preset_status_text 
+            # All parameter controls:
+            ui_values [0 ],# seed 
+            ui_values [1 ],# ss_guidance_strength 
+            ui_values [2 ],# ss_sampling_steps 
+            ui_values [3 ],# slat_guidance_strength 
+            ui_values [4 ],# slat_sampling_steps 
+            ui_values [5 ],# poly_count_pcnt 
+            ui_values [6 ],# xatlas_max_cost 
+            ui_values [7 ],# xatlas_normal_seam_weight 
+            ui_values [8 ],# xatlas_resolution 
+            ui_values [9 ],# xatlas_padding 
+            ui_values [10 ],# normal_map_resolution 
+            ui_values [11 ],# normal_match_input_resolution 
+            ui_values [12 ],# auto_save_obj 
+            ui_values [13 ],# auto_save_glb 
+            ui_values [14 ],# auto_save_ply 
+            ui_values [15 ]# auto_save_stl 
+            )
+            
+        except Exception as e :
+            error_msg =f"Critical error initializing preset UI: {str(e)}"
+            print (f"❌ {error_msg}")
+            import traceback 
+            traceback .print_exc ()
+            
+            # Emergency fallback
+            return (
+            gr .Dropdown (choices =["Default"],value ="Default"),
+            f"❌ Preset system error: {str(e)}",
+            "❌ Preset system failed",
+            # Default parameter values
+            -1 ,3.0 ,50 ,3.0 ,6 ,0.5 ,8.0 ,1.0 ,1024 ,2 ,768 ,True ,True ,True ,True ,True 
+            )
 
     def validate_system_integration ():
 
@@ -1363,6 +1726,73 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     fn =lambda :print (validate_system_integration ()),
     inputs =[],
     outputs =[]
+    )
+
+    # Preset Management Event Handlers
+    save_preset_btn .click (
+    fn =save_preset_ui_handler ,
+    inputs =[
+    preset_name_input ,preset_description_input ,
+    seed ,ss_guidance_strength ,ss_sampling_steps ,
+    slat_guidance_strength ,slat_sampling_steps ,poly_count_slider ,
+    xatlas_max_cost_slider ,xatlas_normal_seam_weight_slider ,xatlas_resolution_slider ,xatlas_padding_slider ,
+    normal_map_resolution_slider ,normal_match_input_res_checkbox ,
+    auto_save_obj_cb ,auto_save_glb_cb ,auto_save_ply_cb ,auto_save_stl_cb 
+    ],
+    outputs =[
+    preset_dropdown ,preset_message_text ,preset_status_text ,
+    preset_name_input ,preset_description_input 
+    ]
+    )
+
+    load_preset_btn .click (
+    fn =load_preset_ui_handler ,
+    inputs =[preset_dropdown ],
+    outputs =[
+    preset_dropdown ,preset_message_text ,preset_status_text ,
+    # All parameter controls need to be updated when loading preset:
+    seed ,ss_guidance_strength ,ss_sampling_steps ,
+    slat_guidance_strength ,slat_sampling_steps ,poly_count_slider ,
+    xatlas_max_cost_slider ,xatlas_normal_seam_weight_slider ,xatlas_resolution_slider ,xatlas_padding_slider ,
+    normal_map_resolution_slider ,normal_match_input_res_checkbox ,
+    auto_save_obj_cb ,auto_save_glb_cb ,auto_save_ply_cb ,auto_save_stl_cb 
+    ]
+    )
+
+    delete_preset_btn .click (
+    fn =delete_preset_ui_handler ,
+    inputs =[preset_dropdown ],
+    outputs =[preset_dropdown ,preset_message_text ,preset_status_text ]
+    )
+
+    # Also handle dropdown change to load preset when user selects from dropdown
+    preset_dropdown .change (
+    fn =load_preset_ui_handler ,
+    inputs =[preset_dropdown ],
+    outputs =[
+    preset_dropdown ,preset_message_text ,preset_status_text ,
+    # All parameter controls:
+    seed ,ss_guidance_strength ,ss_sampling_steps ,
+    slat_guidance_strength ,slat_sampling_steps ,poly_count_slider ,
+    xatlas_max_cost_slider ,xatlas_normal_seam_weight_slider ,xatlas_resolution_slider ,xatlas_padding_slider ,
+    normal_map_resolution_slider ,normal_match_input_res_checkbox ,
+    auto_save_obj_cb ,auto_save_glb_cb ,auto_save_ply_cb ,auto_save_stl_cb 
+    ]
+    )
+
+    # Initialize preset system on app load
+    demo .load (
+    fn =initialize_preset_ui ,
+    inputs =[],
+    outputs =[
+    preset_dropdown ,preset_message_text ,preset_status_text ,
+    # All parameter controls to set initial values:
+    seed ,ss_guidance_strength ,ss_sampling_steps ,
+    slat_guidance_strength ,slat_sampling_steps ,poly_count_slider ,
+    xatlas_max_cost_slider ,xatlas_normal_seam_weight_slider ,xatlas_resolution_slider ,xatlas_padding_slider ,
+    normal_map_resolution_slider ,normal_match_input_res_checkbox ,
+    auto_save_obj_cb ,auto_save_glb_cb ,auto_save_ply_cb ,auto_save_stl_cb 
+    ]
     )
 
     def cleanup_processing_system ():

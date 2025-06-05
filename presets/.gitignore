@@ -1,0 +1,9 @@
+# Preset system files
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Keep structure but ignore temporary files
+backups/*.tmp
+templates/*.tmp
