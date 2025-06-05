@@ -163,10 +163,13 @@ class BatchProcessor:
         image_name = Path(image_path).stem
         existing_files = []
         
+        # With the new subfolder structure, files are saved in {output_folder}/{image_name}/{image_name}.{format}
+        image_subfolder = os.path.join(output_folder, image_name)
+        
         # Check for each enabled format
         for format_name, is_enabled in enabled_formats.items():
             if is_enabled:
-                output_file = os.path.join(output_folder, f"{image_name}.{format_name}")
+                output_file = os.path.join(image_subfolder, f"{image_name}.{format_name}")
                 if os.path.exists(output_file):
                     existing_files.append(output_file)
         
@@ -466,16 +469,15 @@ class BatchProcessor:
             # Get the base name for output files
             input_name = Path(input_image_path).stem
             
-            # For batch processing, the auto-save already handles file naming correctly
-            # based on the logic in auto_save.py, but we could add additional 
-            # batch-specific naming logic here if needed
-            
-            # Log the output location
+            # Log the output location with subfolder information
             if result.auto_save_result:
-                print(f"  Batch output for {input_name}: Folder {result.auto_save_result.get('folder_number', 'unknown')}")
+                folder_path = result.auto_save_result.get('folder_path', 'unknown')
+                print(f"  Batch output for {input_name}: Subfolder '{input_name}' in {settings.output_folder}")
+                print(f"    Full path: {folder_path}")
                 saved_files = result.auto_save_result.get('saved_files', [])
-                for saved_file in saved_files:
-                    print(f"    - {saved_file}")
+                for format_name, file_path in saved_files.items():
+                    if format_name != 'info':  # Don't log the info file
+                        print(f"    - {format_name.upper()}: {os.path.basename(file_path)}")
             
         except Exception as e:
             print(f"Warning: Error handling batch output for {input_image_path}: {e}")

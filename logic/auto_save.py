@@ -145,16 +145,20 @@ def auto_save_generation(mesh_path: str, normal_image=None, enabled_formats: Dic
     try:
         # Use custom output folder for batch processing, or default outputs folder for single processing
         if custom_output_folder:
-            # Batch processing mode
+            # Batch processing mode - create individual subfolder for each image
             outputs_folder = custom_output_folder
             os.makedirs(outputs_folder, exist_ok=True)
             
-            # For batch processing, use the custom filename base if provided
+            # For batch processing, create a subfolder named after the image
             if custom_filename_base:
-                folder_number = custom_filename_base
-                folder_path = outputs_folder
+                # Create a subfolder with the image name inside the batch output folder
+                image_subfolder = os.path.join(outputs_folder, custom_filename_base)
+                os.makedirs(image_subfolder, exist_ok=True)
                 
-                print(f"Auto-save (Batch): Saving to batch output folder: {folder_path}")
+                folder_number = custom_filename_base
+                folder_path = image_subfolder
+                
+                print(f"Auto-save (Batch): Created image subfolder: {folder_path}")
                 print(f"Auto-save (Batch): Using filename base: {folder_number}")
             else:
                 # Fallback to numbered folder approach even in custom output folder
