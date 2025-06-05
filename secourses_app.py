@@ -117,7 +117,24 @@ def preprocess_image (image ):
     if hi3dgen_pipeline is None :
         raise RuntimeError ("FATAL: Hi3DGenPipeline not loaded. Cannot preprocess.")
 
-    return hi3dgen_pipeline .preprocess_image (image ,resolution =1024 )
+    try:
+        return hi3dgen_pipeline .preprocess_image (image ,resolution =1024 )
+    except Exception as e:
+        # If BiRefNet loading fails, try to reset its state and retry once
+        if "BiRefNet" in str(e) or "401" in str(e) or "RepositoryNotFoundError" in str(e):
+            print(f"BiRefNet error detected during preprocess: {e}")
+            print("Attempting to reset BiRefNet state and retry...")
+            try:
+                if hasattr(hi3dgen_pipeline, 'reset_birefnet_state'):
+                    hi3dgen_pipeline.reset_birefnet_state()
+                # Retry the preprocessing
+                return hi3dgen_pipeline .preprocess_image (image ,resolution =1024 )
+            except Exception as retry_e:
+                print(f"Retry after BiRefNet reset also failed: {retry_e}")
+                raise retry_e
+        else:
+            # Re-raise non-BiRefNet errors
+            raise e
 
 def simplify_mesh_open3d (in_mesh :trimesh .Trimesh ,
 poly_count_pcnt :float =0.5 )->trimesh .Trimesh :
@@ -585,7 +602,17 @@ progress=gr.Progress()):
     Generate 3D with integrated cancellation support
     Uses the new ProcessingCore system while maintaining Gradio compatibility
     """
-    global processing_core
+    global processing_core, hi3dgen_pipeline
+    
+    def reset_birefnet_state():
+        """Cleanup callback to reset BiRefNet model state"""
+        try:
+            if hi3dgen_pipeline and hasattr(hi3dgen_pipeline, 'reset_birefnet_state'):
+                print("Cleanup: Resetting BiRefNet model state...")
+                hi3dgen_pipeline.reset_birefnet_state()
+                print("Cleanup: BiRefNet model state reset successfully")
+        except Exception as e:
+            print(f"Cleanup: Error resetting BiRefNet state: {e}")
     
     if not processing_core:
         print("Error: ProcessingCore not initialized, falling back to legacy processing")
@@ -598,6 +625,9 @@ progress=gr.Progress()):
     try:
         # Start single processing with cancellation system
         start_single_processing("Starting single image processing")
+        
+        # Add BiRefNet cleanup callback
+        add_cleanup_callback(reset_birefnet_state)
         
         # Enhanced progress tracking for single processing
         def single_progress_callback(stage: str, details: str = ""):
@@ -697,7 +727,13 @@ progress=gr.Progress()):
         except Exception as fallback_e:
             progress(0.0, desc=f"❌ All processing failed: {str(fallback_e)}")
             print(f"Fallback processing also failed: {fallback_e}")
-            return None, None, None 
+            return None, None, None
+    finally:
+        # Always remove the cleanup callback when done
+        try:
+            remove_cleanup_callback(reset_birefnet_state)
+        except:
+            pass 
 
 def convert_mesh (mesh_path :str ,export_format :str )->Optional [str ]:
 
@@ -1418,12 +1454,17 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                 except Exception as e:
                     print(f"  ⚠️ Error cleaning processing core: {e}")
             
-            # Move pipeline to CPU and clear GPU memory
+            # Reset pipeline state and move to CPU
             if hi3dgen_pipeline:
                 try:
                     # Synchronize CUDA operations before cleanup
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
+                    
+                    # Reset BiRefNet state first
+                    if hasattr(hi3dgen_pipeline, 'reset_birefnet_state'):
+                        hi3dgen_pipeline.reset_birefnet_state()
+                        print("  ✓ BiRefNet state reset")
                     
                     # Move pipeline to CPU
                     hi3dgen_pipeline.cpu()
@@ -1439,6 +1480,10 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                         print(f"  ⚠️ CUDA error during cleanup: {cuda_error}")
                         print("  ⚠️ Attempting force GPU cleanup...")
                         try:
+                            # Force reset BiRefNet state
+                            if hasattr(hi3dgen_pipeline, 'reset_birefnet_state'):
+                                hi3dgen_pipeline.reset_birefnet_state()
+                            
                             # Force clear CUDA cache even if pipeline move failed
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
@@ -1452,6 +1497,8 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                     print(f"  ⚠️ Unexpected error clearing GPU memory: {e}")
                     # Still try to clear CUDA cache if possible
                     try:
+                        if hasattr(hi3dgen_pipeline, 'reset_birefnet_state'):
+                            hi3dgen_pipeline.reset_birefnet_state()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                     except:

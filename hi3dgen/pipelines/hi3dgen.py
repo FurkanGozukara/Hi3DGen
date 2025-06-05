@@ -126,7 +126,15 @@ class Hi3DGenPipeline(Pipeline):
             
             # Load BiRefNet model if not already loaded
             if getattr(self, 'birefnet_model', None) is None:
-                self._lazy_load_birefnet()
+                try:
+                    print("BiRefNet: Loading model for preprocessing...")
+                    self._lazy_load_birefnet()
+                except Exception as e:
+                    print(f"BiRefNet: Error during lazy loading: {e}")
+                    # Reset state and try once more
+                    self.reset_birefnet_state()
+                    print("BiRefNet: Retrying after state reset...")
+                    self._lazy_load_birefnet()
             
             # Get mask using BiRefNet
             mask = self._get_birefnet_mask(input)
@@ -198,11 +206,53 @@ class Hi3DGenPipeline(Pipeline):
     def _lazy_load_birefnet(self):
         """Lazy loading of the BiRefNet model"""
         from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation, AutoModelForImageSegmentation
+        
+        # Try to use local cached model first, then fallback to HF
+        import os
+        birefnet_local_path = None
+        
+        # Check for local cached model in weights directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(current_dir))  # Go up two levels to project root
+        weights_dir = os.path.join(project_root, 'weights')
+        local_birefnet_path = os.path.join(weights_dir, "models--ZhengPeng7--BiRefNet")
+        
+        if os.path.exists(local_birefnet_path):
+            birefnet_local_path = local_birefnet_path
+            print(f"BiRefNet: Using local cached model at {birefnet_local_path}")
+        else:
+            # Fallback to HuggingFace cache or direct download
+            hf_cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+            hf_birefnet_path = os.path.join(hf_cache_dir, "models--ZhengPeng7--BiRefNet")
+            if os.path.exists(hf_birefnet_path):
+                birefnet_local_path = hf_birefnet_path
+                print(f"BiRefNet: Using HuggingFace cached model at {birefnet_local_path}")
+            else:
+                birefnet_local_path = 'ZhengPeng7/BiRefNet'
+                print(f"BiRefNet: Using HuggingFace repository {birefnet_local_path}")
+        
         self.birefnet_model = AutoModelForImageSegmentation.from_pretrained(
-            'weights/BiRefNet',
+            birefnet_local_path,
             trust_remote_code=True
         ).to(self.device)
         self.birefnet_model.eval()
+    
+    def reset_birefnet_state(self):
+        """Reset BiRefNet model state - useful after cancellation or errors"""
+        if hasattr(self, 'birefnet_model'):
+            try:
+                print("Hi3DGen Pipeline: Resetting BiRefNet model state...")
+                del self.birefnet_model
+                # Force garbage collection and CUDA cleanup
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print("Hi3DGen Pipeline: BiRefNet model state reset successfully")
+            except Exception as e:
+                print(f"Hi3DGen Pipeline: Error during BiRefNet reset: {e}")
+        else:
+            print("Hi3DGen Pipeline: No BiRefNet model to reset")
 
     def _get_birefnet_mask(self, image: Image.Image) -> np.ndarray:
         """Get object mask using BiRefNet"""
