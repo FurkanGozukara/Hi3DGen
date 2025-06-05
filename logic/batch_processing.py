@@ -126,7 +126,7 @@ class BatchProcessor:
         if not os.path.exists(input_folder):
             raise ValueError(f"Input folder does not exist: {input_folder}")
         
-        image_files = []
+        image_files_set = set()  # Use set to avoid duplicates
         input_path = Path(input_folder)
         
         # Search for all supported image extensions
@@ -136,10 +136,12 @@ class BatchProcessor:
             files = list(input_path.glob(pattern))
             # Also search uppercase
             files.extend(list(input_path.glob(pattern.upper())))
-            image_files.extend(files)
+            # Add to set to automatically deduplicate
+            for file in files:
+                image_files_set.add(str(file))
         
-        # Convert to strings and sort
-        image_files = [str(f) for f in image_files]
+        # Convert to list and sort
+        image_files = list(image_files_set)
         image_files.sort()
         
         print(f"Discovered {len(image_files)} image files in {input_folder}")
@@ -396,6 +398,9 @@ class BatchProcessor:
             # Load image
             image = Image.open(image_path).convert('RGBA')
             
+            # Get the base name for output files (filename without extension)
+            input_name = Path(image_path).stem
+            
             # Convert BatchSettings to ProcessingParameters
             params = ProcessingParameters(
                 seed=settings.seed,
@@ -424,11 +429,13 @@ class BatchProcessor:
                     full_stage += f" - {details}"
                 update_processing_stage(full_stage)
             
-            # Use ProcessingCore to process the image
+            # Use ProcessingCore to process the image with batch output settings
             result = self.processing_core.process_single_image(
                 image=image,
                 params=params,
-                progress_callback=batch_progress_callback
+                progress_callback=batch_progress_callback,
+                custom_output_folder=settings.output_folder,
+                custom_filename_base=input_name
             )
             
             # Handle batch-specific output file management

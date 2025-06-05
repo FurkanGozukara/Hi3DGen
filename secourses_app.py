@@ -1239,15 +1239,15 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
             success = request_cancellation("User requested cancellation")
             if success:
                 return ("Cancellation requested...", "Cancelling", "Processing will stop soon...",
-                       gr.Button(visible=False), gr.Button(visible=False))
+                       gr.Button(visible=True), gr.Button(visible=False))
             else:
                 return ("No active processing to cancel", "Idle", "Ready",
-                       gr.Button(visible=False), gr.Button(visible=False))
+                       gr.Button(visible=True), gr.Button(visible=False))
         except Exception as e:
             error_msg = f"Error requesting cancellation: {str(e)}"
             print(error_msg)
             return (error_msg, "Error", "Cancellation failed",
-                   gr.Button(visible=False), gr.Button(visible=False))
+                   gr.Button(visible=True), gr.Button(visible=False))
     
     def update_processing_status():
         """Enhanced processing status updates with detailed information"""

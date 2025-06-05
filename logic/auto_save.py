@@ -121,8 +121,19 @@ def save_mesh_in_formats(mesh_path: str, folder_path: str, folder_number: str,
     
     return saved_files
 
-def auto_save_generation(mesh_path: str, normal_image=None, enabled_formats: Dict[str, bool] = None) -> Optional[Dict[str, Any]]:
-    """Main auto-save function"""
+def auto_save_generation(mesh_path: str, normal_image=None, enabled_formats: Dict[str, bool] = None, 
+                        custom_output_folder: Optional[str] = None, 
+                        custom_filename_base: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Main auto-save function
+    
+    Args:
+        mesh_path: Path to the mesh file to save
+        normal_image: Normal map image to save
+        enabled_formats: Dict of format names to boolean enabled status
+        custom_output_folder: Optional custom output folder (for batch processing)
+        custom_filename_base: Optional custom filename base (for batch processing)
+    """
     if enabled_formats is None:
         enabled_formats = {"obj": True, "glb": True, "ply": True, "stl": True}
     
@@ -132,10 +143,28 @@ def auto_save_generation(mesh_path: str, normal_image=None, enabled_formats: Dic
         return None
     
     try:
-        outputs_folder = get_outputs_folder()
-        folder_path, folder_number = create_generation_folder(outputs_folder)
-        
-        print(f"Auto-save: Created generation folder: {folder_path}")
+        # Use custom output folder for batch processing, or default outputs folder for single processing
+        if custom_output_folder:
+            # Batch processing mode
+            outputs_folder = custom_output_folder
+            os.makedirs(outputs_folder, exist_ok=True)
+            
+            # For batch processing, use the custom filename base if provided
+            if custom_filename_base:
+                folder_number = custom_filename_base
+                folder_path = outputs_folder
+                
+                print(f"Auto-save (Batch): Saving to batch output folder: {folder_path}")
+                print(f"Auto-save (Batch): Using filename base: {folder_number}")
+            else:
+                # Fallback to numbered folder approach even in custom output folder
+                folder_path, folder_number = create_generation_folder(outputs_folder)
+                print(f"Auto-save (Batch): Created generation folder: {folder_path}")
+        else:
+            # Single processing mode (original behavior)
+            outputs_folder = get_outputs_folder()
+            folder_path, folder_number = create_generation_folder(outputs_folder)
+            print(f"Auto-save: Created generation folder: {folder_path}")
         
         saved_files = save_mesh_in_formats(mesh_path, folder_path, folder_number, enabled_formats, normal_image)
         

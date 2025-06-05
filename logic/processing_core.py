@@ -104,17 +104,21 @@ class ProcessingCore:
     def process_single_image(self, 
                            image: Image.Image, 
                            params: ProcessingParameters,
-                           progress_callback: Optional[callable] = None) -> ProcessingResult:
+                           progress_callback: Optional[callable] = None,
+                           custom_output_folder: Optional[str] = None,
+                           custom_filename_base: Optional[str] = None) -> ProcessingResult:
         """
-        Process a single image through the complete 3D generation pipeline
+        Process a single image to generate 3D model
         
         Args:
-            image: Input PIL image
+            image: Input image
             params: Processing parameters
-            progress_callback: Optional callback for progress updates
+            progress_callback: Optional progress callback function
+            custom_output_folder: Optional custom output folder (for batch processing)
+            custom_filename_base: Optional custom filename base (for batch processing)
             
         Returns:
-            ProcessingResult with all outputs and timing information
+            ProcessingResult with success status and generated files
         """
         result = ProcessingResult()
         start_time = time.time()
@@ -173,7 +177,7 @@ class ProcessingCore:
             # Stage 3: Auto-save (if enabled)
             if any([params.auto_save_obj, params.auto_save_glb, params.auto_save_ply, params.auto_save_stl]):
                 result.auto_save_result = self._perform_auto_save(
-                    result.mesh_path, result.normal_image, params, update_progress, result
+                    result.mesh_path, result.normal_image, params, update_progress, result, custom_output_folder, custom_filename_base
                 )
             
             # Final success
@@ -510,8 +514,21 @@ class ProcessingCore:
                           normal_image: Image.Image,
                           params: ProcessingParameters,
                           update_progress: callable,
-                          result: ProcessingResult) -> Optional[Dict[str, Any]]:
-        """Perform auto-save if enabled"""
+                          result: ProcessingResult,
+                          custom_output_folder: Optional[str] = None,
+                          custom_filename_base: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Perform auto-save if enabled
+        
+        Args:
+            mesh_path: Path to the generated mesh
+            normal_image: Generated normal image
+            params: Processing parameters
+            update_progress: Progress callback
+            result: Processing result object
+            custom_output_folder: Optional custom output folder (for batch processing)
+            custom_filename_base: Optional custom filename base (for batch processing)
+        """
         start_time = time.time()
         
         try:
@@ -527,14 +544,20 @@ class ProcessingCore:
             # Import auto_save function from logic module
             from .auto_save import auto_save_generation
             
+            # Call auto_save with batch parameters if provided
             auto_save_result = auto_save_generation(
                 mesh_path=mesh_path,
                 normal_image=normal_image,
-                enabled_formats=enabled_formats
+                enabled_formats=enabled_formats,
+                custom_output_folder=custom_output_folder,
+                custom_filename_base=custom_filename_base
             )
             
             if auto_save_result:
-                print(f"✓ Auto-save successful: Saved to folder {auto_save_result['folder_number']}")
+                if custom_output_folder:
+                    print(f"✓ Batch auto-save successful: Saved files to {custom_output_folder}")
+                else:
+                    print(f"✓ Auto-save successful: Saved to folder {auto_save_result['folder_number']}")
                 print(f"  Saved {len(auto_save_result['saved_files'])} files")
             else:
                 print("✗ Auto-save failed")
