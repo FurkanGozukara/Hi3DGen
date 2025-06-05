@@ -207,12 +207,56 @@ class ProcessingCore:
             nonlocal current_normal_predictor_instance
             if current_normal_predictor_instance is not None:
                 print("Cleanup: Unloading normal predictor...")
-                if hasattr(current_normal_predictor_instance, 'model') and hasattr(current_normal_predictor_instance.model, 'cpu'):
-                    current_normal_predictor_instance.model.cpu()
-                del current_normal_predictor_instance
-                current_normal_predictor_instance = None
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                try:
+                    # Synchronize CUDA operations before cleanup
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
+                    # Move model to CPU if possible
+                    if hasattr(current_normal_predictor_instance, 'model') and hasattr(current_normal_predictor_instance.model, 'cpu'):
+                        current_normal_predictor_instance.model.cpu()
+                    
+                    del current_normal_predictor_instance
+                    current_normal_predictor_instance = None
+                    
+                    # Clear CUDA cache
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+                    print("Cleanup: Normal predictor unloaded successfully")
+                    
+                except RuntimeError as cuda_error:
+                    if "CUDA" in str(cuda_error):
+                        print(f"Cleanup: CUDA error during normal predictor cleanup: {cuda_error}")
+                        print("Cleanup: Attempting force cleanup of normal predictor...")
+                        try:
+                            # Force cleanup
+                            if current_normal_predictor_instance is not None:
+                                del current_normal_predictor_instance
+                                current_normal_predictor_instance = None
+                            
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                            
+                            print("Cleanup: Force cleanup of normal predictor completed")
+                        except Exception as force_error:
+                            print(f"Cleanup: Force cleanup of normal predictor also failed: {force_error}")
+                            # Ensure variable is reset
+                            current_normal_predictor_instance = None
+                    else:
+                        # Re-raise non-CUDA errors
+                        raise
+                except Exception as e:
+                    print(f"Cleanup: Unexpected error during normal predictor cleanup: {e}")
+                    # Ensure variable is reset
+                    current_normal_predictor_instance = None
+                    # Still try to clear CUDA cache if possible
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except:
+                        pass
         
         add_cleanup_callback(cleanup_normal_predictor)
         
@@ -294,10 +338,50 @@ class ProcessingCore:
             nonlocal pipeline_on_gpu
             if pipeline_on_gpu:
                 print("Cleanup: Moving Hi3DGen pipeline to CPU...")
-                self.hi3dgen_pipeline.cpu()
-                pipeline_on_gpu = False
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                try:
+                    # Synchronize CUDA operations before moving to CPU
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
+                    # Try to move pipeline to CPU
+                    self.hi3dgen_pipeline.cpu()
+                    pipeline_on_gpu = False
+                    print("Cleanup: Successfully moved Hi3DGen pipeline to CPU")
+                    
+                    # Clear CUDA cache
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        print("Cleanup: CUDA cache cleared")
+                        
+                except RuntimeError as cuda_error:
+                    if "CUDA" in str(cuda_error):
+                        print(f"Cleanup: CUDA error during pipeline cleanup: {cuda_error}")
+                        print("Cleanup: Attempting force cleanup...")
+                        try:
+                            # Force clear CUDA cache and reset pipeline state
+                            pipeline_on_gpu = False
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                # Try to reset CUDA context
+                                torch.cuda.synchronize()
+                            print("Cleanup: Force cleanup completed")
+                        except Exception as force_error:
+                            print(f"Cleanup: Force cleanup also failed: {force_error}")
+                            # Mark as cleaned up anyway to prevent further attempts
+                            pipeline_on_gpu = False
+                    else:
+                        # Re-raise non-CUDA errors
+                        raise
+                except Exception as e:
+                    print(f"Cleanup: Unexpected error during pipeline cleanup: {e}")
+                    # Mark as cleaned up to prevent further attempts
+                    pipeline_on_gpu = False
+                    # Still try to clear CUDA cache if possible
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except:
+                        pass
         
         add_cleanup_callback(cleanup_pipeline)
         

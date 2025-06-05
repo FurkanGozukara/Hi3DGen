@@ -381,10 +381,55 @@ auto_save_stl :bool =True ):
     finally :
         if current_normal_predictor_instance is not None :
             print ("Normal Prediction: Unloading model...")
-            if hasattr (current_normal_predictor_instance ,'model')and hasattr (current_normal_predictor_instance .model ,'cpu'):
-                current_normal_predictor_instance .model .cpu ()
-            del current_normal_predictor_instance 
-            if torch .cuda .is_available ():torch .cuda .empty_cache ()
+            try:
+                # Synchronize CUDA operations before cleanup
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                # Move model to CPU if possible
+                if hasattr(current_normal_predictor_instance, 'model') and hasattr(current_normal_predictor_instance.model, 'cpu'):
+                    current_normal_predictor_instance.model.cpu()
+                
+                del current_normal_predictor_instance
+                
+                # Clear CUDA cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
+                print("Normal Prediction: Model unloaded successfully")
+                
+            except RuntimeError as cuda_error:
+                if "CUDA" in str(cuda_error):
+                    print(f"Normal Prediction: CUDA error during cleanup: {cuda_error}")
+                    print("Normal Prediction: Attempting force cleanup...")
+                    try:
+                        # Force cleanup
+                        if current_normal_predictor_instance is not None:
+                            del current_normal_predictor_instance
+                        
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        
+                        print("Normal Prediction: Force cleanup completed")
+                    except Exception as force_error:
+                        print(f"Normal Prediction: Force cleanup also failed: {force_error}")
+                else:
+                    print(f"Normal Prediction: Non-CUDA error during cleanup: {cuda_error}")
+            except Exception as e:
+                print(f"Normal Prediction: Unexpected error during cleanup: {e}")
+                # Ensure variable is reset
+                if 'current_normal_predictor_instance' in locals():
+                    try:
+                        del current_normal_predictor_instance
+                    except:
+                        pass
+                # Still try to clear CUDA cache if possible
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except:
+                    pass
 
     if normal_image_pil is None :
         print ("ERROR: Normal map not generated after Stage 1. Aborting 3D generation.")
@@ -456,8 +501,41 @@ auto_save_stl :bool =True ):
     finally :
         if pipeline_on_gpu :
             print ("3D Generation: Moving Hi3DGen pipeline to CPU...")
-            hi3dgen_pipeline .cpu ()
-            if torch .cuda .is_available ():torch .cuda .empty_cache ()
+            try:
+                # Synchronize CUDA operations before moving to CPU
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                hi3dgen_pipeline.cpu()
+                
+                # Clear CUDA cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
+                print("3D Generation: Successfully moved Hi3DGen pipeline to CPU")
+                
+            except RuntimeError as cuda_error:
+                if "CUDA" in str(cuda_error):
+                    print(f"3D Generation: CUDA error during pipeline cleanup: {cuda_error}")
+                    print("3D Generation: Attempting force cleanup...")
+                    try:
+                        # Force clear CUDA cache even if pipeline move failed
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        print("3D Generation: Force cleanup completed")
+                    except Exception as force_error:
+                        print(f"3D Generation: Force cleanup also failed: {force_error}")
+                else:
+                    print(f"3D Generation: Non-CUDA error during cleanup: {cuda_error}")
+            except Exception as e:
+                print(f"3D Generation: Unexpected error during pipeline cleanup: {e}")
+                # Still try to clear CUDA cache if possible
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except:
+                    pass
 
     # Auto-save logic
     if gradio_model_path and (auto_save_obj or auto_save_glb or auto_save_ply or auto_save_stl):
@@ -1343,12 +1421,41 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
             # Move pipeline to CPU and clear GPU memory
             if hi3dgen_pipeline:
                 try:
+                    # Synchronize CUDA operations before cleanup
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
+                    # Move pipeline to CPU
                     hi3dgen_pipeline.cpu()
+                    
+                    # Clear CUDA cache
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    
                     print("  ✓ GPU memory cleared")
+                    
+                except RuntimeError as cuda_error:
+                    if "CUDA" in str(cuda_error):
+                        print(f"  ⚠️ CUDA error during cleanup: {cuda_error}")
+                        print("  ⚠️ Attempting force GPU cleanup...")
+                        try:
+                            # Force clear CUDA cache even if pipeline move failed
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                            print("  ✓ Force GPU cleanup completed")
+                        except Exception as force_error:
+                            print(f"  ❌ Force GPU cleanup also failed: {force_error}")
+                    else:
+                        print(f"  ⚠️ Non-CUDA error during GPU cleanup: {cuda_error}")
                 except Exception as e:
-                    print(f"  ⚠️ Error clearing GPU memory: {e}")
+                    print(f"  ⚠️ Unexpected error clearing GPU memory: {e}")
+                    # Still try to clear CUDA cache if possible
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except:
+                        pass
             
             print("🧹 Cleanup completed")
             

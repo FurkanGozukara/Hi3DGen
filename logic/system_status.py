@@ -136,8 +136,29 @@ class SystemStatusChecker:
         # Hi3DGen Pipeline
         if hi3dgen_pipeline is not None:
             try:
-                # Safely check device location
-                device = "GPU" if next(hi3dgen_pipeline.parameters()).is_cuda else "CPU"
+                # Try multiple methods to determine device location for Hi3DGenPipeline
+                device = "Unknown"
+                
+                # Method 1: Check if pipeline has a device attribute
+                if hasattr(hi3dgen_pipeline, 'device'):
+                    device = str(hi3dgen_pipeline.device)
+                # Method 2: Check if pipeline has individual model components
+                elif hasattr(hi3dgen_pipeline, 'model') and hasattr(hi3dgen_pipeline.model, 'device'):
+                    device = str(hi3dgen_pipeline.model.device)
+                # Method 3: Try to check if pipeline has parameters (for PyTorch models)
+                elif hasattr(hi3dgen_pipeline, 'parameters'):
+                    try:
+                        device = "GPU" if next(hi3dgen_pipeline.parameters()).is_cuda else "CPU"
+                    except (StopIteration, AttributeError):
+                        pass
+                # Method 4: Check for common pipeline components
+                elif hasattr(hi3dgen_pipeline, 'sparse_structure_sampler'):
+                    if hasattr(hi3dgen_pipeline.sparse_structure_sampler, 'device'):
+                        device = str(hi3dgen_pipeline.sparse_structure_sampler.device)
+                # Method 5: Fallback - assume CPU unless proven otherwise
+                else:
+                    device = "CPU (assumed)"
+                
                 status.components["Hi3DGenPipeline"] = {
                     "status": "Available",
                     "device": device,
@@ -147,9 +168,9 @@ class SystemStatusChecker:
                 status.components["Hi3DGenPipeline"] = {
                     "status": "Available",
                     "device": "Unknown",
-                    "details": f"Pipeline available but device check failed: {str(e)}"
+                    "details": f"Pipeline available, device unknown: {str(e)}"
                 }
-                status.warnings.append(f"Pipeline device check failed: {str(e)}")
+                # Don't add this as a warning since it's not critical
         else:
             status.components["Hi3DGenPipeline"] = {
                 "status": "Missing", 
@@ -265,10 +286,13 @@ class SystemStatusChecker:
                     if memory_usage_percent > 85:
                         status.warnings.append(f"High GPU memory usage: {memory_usage_percent:.1f}%")
                 
+                # Add status key to gpu_info
+                gpu_info["status"] = "Available"
                 status.components["GPU"] = gpu_info
                 
             else:
                 status.components["GPU"] = {
+                    "status": "Missing",
                     "available": False,
                     "details": "CUDA not available"
                 }
@@ -286,9 +310,9 @@ class SystemStatusChecker:
                 cancel_status = manager.get_status()
                 status.components["CancellationManager"] = {
                     "status": "Available",
-                    "current_state": cancel_status.current_state.name,
+                    "current_state": cancel_status.processing_state.name,
                     "is_cancelled": cancel_status.is_cancelled,
-                    "details": f"State: {cancel_status.current_state.name}"
+                    "details": f"State: {cancel_status.processing_state.name}"
                 }
             else:
                 status.components["CancellationManager"] = {
@@ -314,7 +338,7 @@ class SystemStatusChecker:
             core_components = ["ProcessingCore", "BatchProcessor", "Hi3DGenPipeline"]
             available_components = sum(1 for comp in core_components 
                                      if comp in status.components and 
-                                     status.components[comp]["status"] not in ["Missing", "Error"])
+                                     status.components[comp].get("status", "Unknown") not in ["Missing", "Error", "Unknown"])
             
             if available_components == len(core_components):
                 status.overall_health = "Excellent"
@@ -334,8 +358,10 @@ class SystemStatusChecker:
         # Components
         summary += "🔧 Components:\n"
         for comp_name, comp_info in status.components.items():
-            status_icon = "✅" if comp_info["status"] not in ["Missing", "Error"] else "❌"
-            summary += f"  {status_icon} {comp_name}: {comp_info['status']}\n"
+            # Get status safely with fallback
+            comp_status = comp_info.get("status", "Unknown")
+            status_icon = "✅" if comp_status not in ["Missing", "Error", "Unknown"] else "❌"
+            summary += f"  {status_icon} {comp_name}: {comp_status}\n"
             if "details" in comp_info:
                 summary += f"     {comp_info['details']}\n"
         
