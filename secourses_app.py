@@ -14,8 +14,28 @@ import trimesh
 import open3d as o3d 
 import xatlas 
 import argparse
+import threading
 from logic.auto_save import auto_save_generation, open_outputs_folder
-from logic.parameter_info import format_parameter_info_html 
+from logic.parameter_info import format_parameter_info_html
+from logic.processing_core import ProcessingCore, ProcessingParameters
+from logic.batch_processing import create_batch_processor, BatchSettings
+from logic.cancellation import (
+    get_cancellation_manager, request_cancellation, get_status_summary,
+    start_single_processing, finish_processing, should_cancel
+) 
+
+# Safe import of system status module
+try:
+    from logic.system_status import get_status_summary as get_comprehensive_status_summary, print_system_status
+    SYSTEM_STATUS_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ System status module not available: {e}")
+    SYSTEM_STATUS_AVAILABLE = False
+    # Fallback functions
+    def get_comprehensive_status_summary(*args, **kwargs):
+        return "🔍 System Status: Basic monitoring only (system_status module unavailable)"
+    def print_system_status(*args, **kwargs):
+        print("⚠️ Advanced system status unavailable")
 
 MAX_SEED =np .iinfo (np .int32 ).max 
 TMP_DIR =os .path .join (os .path .dirname (os .path .abspath (__file__ )),'tmp')
@@ -25,7 +45,12 @@ os .makedirs (WEIGHTS_DIR ,exist_ok =True )
 
 hi3dgen_pipeline =None 
 normal_predictor =None 
-global_cached_paths =None 
+global_cached_paths =None
+
+# Global processing system
+processing_core = None
+batch_processor = None
+cancellation_manager = None 
 
 def cache_weights (weights_dir :str )->dict :
     import os 
@@ -461,7 +486,140 @@ auto_save_stl :bool =True ):
             print(f"Auto-save error: {e}")
             traceback.print_exc()
 
-    return normal_image_pil ,gradio_model_path ,gradio_model_path 
+    return normal_image_pil ,gradio_model_path ,gradio_model_path
+
+def generate_3d_with_cancellation(image ,seed =-1 ,
+ss_guidance_strength =3 ,ss_sampling_steps =50 ,
+slat_guidance_strength =3 ,slat_sampling_steps =6 ,
+poly_count_pcnt :float =0.5 ,
+xatlas_max_cost :float =8.0 ,
+xatlas_normal_seam_weight :float =1.0 ,
+xatlas_resolution :int =1024 ,
+xatlas_padding :int =2 ,
+normal_map_resolution :int =768 ,
+normal_match_input_resolution :bool =True ,
+auto_save_obj :bool =True ,
+auto_save_glb :bool =True ,
+auto_save_ply :bool =True ,
+auto_save_stl :bool =True ,
+progress=gr.Progress()):
+    """
+    Generate 3D with integrated cancellation support
+    Uses the new ProcessingCore system while maintaining Gradio compatibility
+    """
+    global processing_core
+    
+    if not processing_core:
+        print("Error: ProcessingCore not initialized, falling back to legacy processing")
+        return generate_3d(image, seed, ss_guidance_strength, ss_sampling_steps, 
+                          slat_guidance_strength, slat_sampling_steps, poly_count_pcnt,
+                          xatlas_max_cost, xatlas_normal_seam_weight, xatlas_resolution, xatlas_padding,
+                          normal_map_resolution, normal_match_input_resolution,
+                          auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl)
+    
+    try:
+        # Start single processing with cancellation system
+        start_single_processing("Starting single image processing")
+        
+        # Enhanced progress tracking for single processing
+        def single_progress_callback(stage: str, details: str = ""):
+            """Progress callback for single image processing"""
+            try:
+                # Map stages to progress percentages
+                stage_progress = {
+                    "Initialization": 0.05,
+                    "Normal Prediction": 0.25,
+                    "3D Generation": 0.60,
+                    "Mesh Processing": 0.75,
+                    "UV Unwrapping": 0.85,
+                    "File Export": 0.95,
+                    "Auto-save": 0.98,
+                    "Completed": 1.0
+                }
+                
+                # Get progress based on stage
+                current_progress = 0.0
+                for stage_name, prog in stage_progress.items():
+                    if stage_name.lower() in stage.lower():
+                        current_progress = prog
+                        break
+                
+                # Update progress bar
+                desc = f"{stage}: {details}" if details else stage
+                progress(current_progress, desc=desc)
+                
+                print(f"Single Processing Progress: {desc} ({current_progress*100:.1f}%)")
+                
+            except Exception as e:
+                print(f"Error in single progress callback: {e}")
+        
+        # Initialize progress
+        progress(0.0, desc="Starting single image processing...")
+        
+        # Create processing parameters
+        params = ProcessingParameters(
+            seed=seed,
+            ss_guidance_strength=ss_guidance_strength,
+            ss_sampling_steps=ss_sampling_steps,
+            slat_guidance_strength=slat_guidance_strength,
+            slat_sampling_steps=slat_sampling_steps,
+            poly_count_pcnt=poly_count_pcnt,
+            xatlas_max_cost=xatlas_max_cost,
+            xatlas_normal_seam_weight=xatlas_normal_seam_weight,
+            xatlas_resolution=xatlas_resolution,
+            xatlas_padding=xatlas_padding,
+            normal_map_resolution=normal_map_resolution,
+            normal_match_input_resolution=normal_match_input_resolution,
+            auto_save_obj=auto_save_obj,
+            auto_save_glb=auto_save_glb,
+            auto_save_ply=auto_save_ply,
+            auto_save_stl=auto_save_stl
+        )
+        
+        # Process using ProcessingCore with progress callback
+        result = processing_core.process_single_image(image, params, single_progress_callback)
+        
+        # Final progress update
+        if result.success:
+            progress(1.0, desc=f"✅ Completed successfully in {result.total_time:.1f}s")
+        else:
+            progress(0.0, desc=f"❌ Failed: {result.error_message}")
+        
+        # Finish processing
+        finish_processing("Single processing completed" if result.success else "Single processing failed")
+        
+        # Return in Gradio-compatible format
+        if result.success:
+            print(f"Single processing completed successfully: {result.get_summary()}")
+            return result.normal_image, result.mesh_path, result.mesh_path
+        else:
+            print(f"Processing failed: {result.error_message}")
+            return None, None, None
+            
+    except Exception as e:
+        progress(0.0, desc=f"❌ Error: {str(e)}")
+        finish_processing(f"Single processing error: {str(e)}")
+        print(f"Error in generate_3d_with_cancellation: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Fallback to legacy processing
+        try:
+            progress(0.0, desc="🔄 Falling back to legacy processing...")
+            result = generate_3d(image, seed, ss_guidance_strength, ss_sampling_steps, 
+                              slat_guidance_strength, slat_sampling_steps, poly_count_pcnt,
+                              xatlas_max_cost, xatlas_normal_seam_weight, xatlas_resolution, xatlas_padding,
+                              normal_map_resolution, normal_match_input_resolution,
+                              auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl)
+            if result[1] is not None:  # mesh_path is not None
+                progress(1.0, desc="✅ Legacy processing completed")
+            else:
+                progress(0.0, desc="❌ Legacy processing failed")
+            return result
+        except Exception as fallback_e:
+            progress(0.0, desc=f"❌ All processing failed: {str(fallback_e)}")
+            print(f"Fallback processing also failed: {fallback_e}")
+            return None, None, None 
 
 def convert_mesh (mesh_path :str ,export_format :str )->Optional [str ]:
 
@@ -526,6 +684,56 @@ footer {visibility: hidden}
     width: 100% !important;
     height: 100% !important;
 }
+/* Batch processing styles */
+.batch-status {
+    font-family: monospace;
+    background-color: #f8f9fa;
+    padding: 10px;
+    border-radius: 4px;
+}
+.batch-progress {
+    margin: 10px 0;
+}
+.cancel-button {
+    background-color: #dc3545 !important;
+    border-color: #dc3545 !important;
+}
+.processing-active {
+    animation: pulse 2s infinite;
+}
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.7; }
+    100% { opacity: 1; }
+}
+/* Enhanced progress display styles */
+.progress-container {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border-radius: 8px;
+    padding: 15px;
+    margin: 10px 0;
+    color: white;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+.status-success {
+    background-color: #d4edda !important;
+    border-color: #c3e6cb !important;
+    color: #155724 !important;
+}
+.status-error {
+    background-color: #f8d7da !important;
+    border-color: #f5c6cb !important;
+    color: #721c24 !important;
+}
+.status-processing {
+    background-color: #d1ecf1 !important;
+    border-color: #bee5eb !important;
+    color: #0c5460 !important;
+}
+.emoji-status {
+    font-size: 1.2em;
+    margin-right: 8px;
+}
 """
 
 with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
@@ -544,8 +752,63 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                     with gr .Row ():
                         gen_shape_btn =gr .Button ("Generate Shape",size ="lg",variant ="primary")
 
-                with gr .Tab ("Multiple Images"):
-                    gr .Markdown ("<div style='text-align: center; padding: 40px; font-size: 24px;'>Multiple Images functionality is coming soon!</div>")
+                with gr .Tab ("📦 Batch Processing"):
+                    with gr .Row ():
+                        with gr .Column (scale =1 ):
+                            gr .Markdown ("### Input Configuration")
+                            batch_input_folder = gr .Textbox (
+                                label ="Input Folder",
+                                placeholder ="Path to folder containing images",
+                                info ="Folder containing images to process (jpg, png, bmp, tiff, webp)"
+                            )
+                            batch_output_folder = gr .Textbox (
+                                label ="Output Folder", 
+                                placeholder ="Path to save generated 3D models",
+                                info ="Folder where generated files will be saved"
+                            )
+                            
+                            with gr .Row ():
+                                batch_skip_existing = gr .Checkbox (
+                                    value =True ,
+                                    label ="Skip Existing Files",
+                                    info ="Skip images that already have generated output files"
+                                )
+                                batch_use_current_settings = gr .Checkbox (
+                                    value =True ,
+                                    label ="Use Current Settings",
+                                    info ="Use the advanced settings from the current session"
+                                )
+                        
+                        with gr .Column (scale =1 ):
+                            gr .Markdown ("### Batch Control")
+                            with gr .Row ():
+                                batch_start_btn = gr .Button (
+                                    "🚀 Start Batch Processing",
+                                    size ="lg",
+                                    variant ="primary"
+                                )
+                                batch_cancel_btn = gr .Button (
+                                    "⏹️ Cancel",
+                                    size ="lg",
+                                    variant ="stop"
+                                )
+                            
+                            # Progress display
+                            batch_progress_bar = gr .Progress ()
+                            batch_status_text = gr .Textbox (
+                                label ="Status",
+                                value ="Ready",
+                                interactive =False ,
+                                lines =3
+                            )
+                            
+                            # Results summary
+                            batch_results_text = gr .Textbox (
+                                label ="Results Summary",
+                                value ="No batch processing started yet",
+                                interactive =False ,
+                                lines =5
+                            )
 
                 with gr .Tab ("📋 Parameter Guide"):
                     with gr.Row():
@@ -612,6 +875,21 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                     )
 
         with gr .Column (scale =1 ):
+            # Universal cancel button and status
+            with gr .Row ():
+                universal_cancel_btn = gr .Button (
+                    "⏹️ Cancel Processing",
+                    size ="lg",
+                    variant ="stop",
+                    visible =False
+                )
+                processing_status_text = gr .Textbox (
+                    label ="Processing Status",
+                    value ="Idle",
+                    interactive =False ,
+                    scale =2
+                )
+            
             with gr .Column ():
                 model_output =gr .Model3D (label ="3D Model Preview (Each model is approximately 40MB, may take around 1 minute to load)")
             with gr .Column ():
@@ -650,7 +928,7 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     )
 
     gen_shape_btn .click (
-    generate_3d ,
+    generate_3d_with_cancellation ,
     inputs =[
     image_prompt ,seed ,
     ss_guidance_strength ,ss_sampling_steps ,
@@ -667,7 +945,8 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     auto_save_ply_cb ,
     auto_save_stl_cb 
     ],
-    outputs =[normal_output ,model_output ,download_btn ]
+    outputs =[normal_output ,model_output ,download_btn ],
+    show_progress =True
     ).then (
     lambda :gr .Button (interactive =True ),
     outputs =[download_btn ],
@@ -723,6 +1002,364 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
         inputs=[],
         outputs=[]
     )
+    
+    # System validation function using comprehensive status module
+    def validate_system_integration():
+        """Validate that all system components are properly integrated"""
+        try:
+            return get_comprehensive_status_summary(
+                processing_core=processing_core,
+                batch_processor=batch_processor,
+                hi3dgen_pipeline=hi3dgen_pipeline,
+                weights_dir=WEIGHTS_DIR,
+                tmp_dir=TMP_DIR
+            )
+        except Exception as e:
+            return f"❌ Validation error: {str(e)}"
+    
+    # Enhanced batch processing functions with progress integration
+    def start_batch_processing_ui(input_folder, output_folder, skip_existing, use_current_settings,
+                                 seed, ss_guidance_strength, ss_sampling_steps,
+                                 slat_guidance_strength, slat_sampling_steps, poly_count_pcnt,
+                                 xatlas_max_cost, xatlas_normal_seam_weight, xatlas_resolution, xatlas_padding,
+                                 normal_map_resolution, normal_match_input_resolution,
+                                 auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl,
+                                 progress=gr.Progress()):
+        """Start batch processing with enhanced UI integration and progress tracking"""
+        global batch_processor
+        
+        if not batch_processor:
+            return ("Error: Batch processor not initialized", "Failed", "No batch processor available", 
+                   gr.Button(visible=True), gr.Button(visible=False))
+        
+        if not input_folder or not output_folder:
+            return ("Error: Please specify both input and output folders", "Failed", "Missing folder paths",
+                   gr.Button(visible=False), gr.Button(visible=False))
+        
+        # Validate folders exist
+        if not os.path.exists(input_folder):
+            return (f"Error: Input folder does not exist: {input_folder}", "Failed", "Invalid input folder",
+                   gr.Button(visible=True), gr.Button(visible=False))
+        
+        try:
+            # Set up progress callback for batch processor
+            def batch_progress_callback(batch_progress):
+                """Enhanced progress callback with Gradio progress integration"""
+                try:
+                    if batch_progress.total_images > 0:
+                        percentage = batch_progress.progress_percentage / 100.0
+                        current_stage = batch_progress.current_stage
+                        
+                        # Update Gradio progress bar
+                        progress(percentage, desc=f"{current_stage} ({batch_progress.processed_images}/{batch_progress.total_images})")
+                        
+                        # Log detailed progress
+                        if batch_progress.current_image:
+                            eta_text = ""
+                            if batch_progress.estimated_time_remaining > 0:
+                                eta_minutes = batch_progress.estimated_time_remaining / 60
+                                if eta_minutes > 1:
+                                    eta_text = f", ETA: {eta_minutes:.1f}min"
+                                else:
+                                    eta_text = f", ETA: {batch_progress.estimated_time_remaining:.0f}s"
+                            
+                            print(f"Batch Progress: {current_stage} - {batch_progress.processed_images}/{batch_progress.total_images} ({batch_progress.progress_percentage:.1f}%{eta_text})")
+                    else:
+                        progress(0.0, desc=batch_progress.current_stage)
+                        
+                except Exception as e:
+                    print(f"Error in batch progress callback: {e}")
+            
+            # Set the progress callback
+            batch_processor.set_progress_callback(batch_progress_callback)
+            
+            # Create batch settings
+            settings = BatchSettings(
+                input_folder=input_folder,
+                output_folder=output_folder,
+                skip_existing=skip_existing,
+                seed=seed if use_current_settings else -1,
+                ss_guidance_strength=ss_guidance_strength if use_current_settings else 3.0,
+                ss_sampling_steps=ss_sampling_steps if use_current_settings else 50,
+                slat_guidance_strength=slat_guidance_strength if use_current_settings else 3.0,
+                slat_sampling_steps=slat_sampling_steps if use_current_settings else 6,
+                poly_count_pcnt=poly_count_pcnt if use_current_settings else 0.5,
+                xatlas_max_cost=xatlas_max_cost if use_current_settings else 8.0,
+                xatlas_normal_seam_weight=xatlas_normal_seam_weight if use_current_settings else 1.0,
+                xatlas_resolution=xatlas_resolution if use_current_settings else 1024,
+                xatlas_padding=xatlas_padding if use_current_settings else 2,
+                normal_map_resolution=normal_map_resolution if use_current_settings else 768,
+                normal_match_input_resolution=normal_match_input_resolution if use_current_settings else True,
+                auto_save_obj=auto_save_obj if use_current_settings else True,
+                auto_save_glb=auto_save_glb if use_current_settings else True,
+                auto_save_ply=auto_save_ply if use_current_settings else True,
+                auto_save_stl=auto_save_stl if use_current_settings else True
+            )
+            
+            # Validate settings
+            print(f"Starting batch processing:")
+            print(f"  Input folder: {input_folder}")
+            print(f"  Output folder: {output_folder}")
+            print(f"  Skip existing: {skip_existing}")
+            print(f"  Use current settings: {use_current_settings}")
+            
+            # Initialize progress
+            progress(0.0, desc="Initializing batch processing...")
+            
+            # Start batch processing in a separate thread
+            
+            def run_batch():
+                try:
+                    print("Starting batch processing thread...")
+                    result = batch_processor.start_batch_processing(settings)
+                    
+                    # Final progress update
+                    if result.processed_images > 0:
+                        success_rate = (result.processed_images / (result.processed_images + len(result.errors))) * 100 if (result.processed_images + len(result.errors)) > 0 else 0
+                        progress(1.0, desc=f"✅ Completed: {result.processed_images} processed, {len(result.errors)} errors ({success_rate:.1f}% success)")
+                    else:
+                        progress(0.0, desc="⚠️ No images processed")
+                    
+                    print(f"Batch processing completed: {result.processed_images} processed, {len(result.errors)} errors")
+                    
+                    # Log detailed results
+                    if result.processed_images > 0:
+                        print(f"✅ Successfully processed {result.processed_images} images")
+                    if len(result.errors) > 0:
+                        print(f"❌ {len(result.errors)} images failed processing:")
+                        for error in result.errors[:5]:  # Show first 5 errors
+                            print(f"  • {error}")
+                        if len(result.errors) > 5:
+                            print(f"  • ... and {len(result.errors) - 5} more errors")
+                    if len(result.skipped) > 0:
+                        print(f"⏭️ Skipped {len(result.skipped)} existing files")
+                    
+                except Exception as e:
+                    progress(0.0, desc=f"Error: {str(e)}")
+                    print(f"Batch processing error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            batch_thread = threading.Thread(target=run_batch, daemon=True)
+            batch_thread.start()
+            
+            return ("Batch processing started...", "Running", "Initializing batch processing...",
+                   gr.Button(visible=False), gr.Button(visible=True))
+            
+        except Exception as e:
+            error_msg = f"Error starting batch processing: {str(e)}"
+            print(error_msg)
+            import traceback
+            traceback.print_exc()
+            progress(0.0, desc=f"Failed: {str(e)}")
+            return (error_msg, "Failed", "Error occurred", 
+                   gr.Button(visible=False), gr.Button(visible=False))
+    
+    def cancel_processing_ui():
+        """Cancel any active processing"""
+        try:
+            success = request_cancellation("User requested cancellation")
+            if success:
+                return ("Cancellation requested...", "Cancelling", "Processing will stop soon...",
+                       gr.Button(visible=False), gr.Button(visible=False))
+            else:
+                return ("No active processing to cancel", "Idle", "Ready",
+                       gr.Button(visible=False), gr.Button(visible=False))
+        except Exception as e:
+            error_msg = f"Error requesting cancellation: {str(e)}"
+            print(error_msg)
+            return (error_msg, "Error", "Cancellation failed",
+                   gr.Button(visible=False), gr.Button(visible=False))
+    
+    def update_processing_status():
+        """Enhanced processing status updates with detailed information"""
+        try:
+            global_status = get_status_summary()
+            
+            if batch_processor and hasattr(batch_processor, 'get_status_summary'):
+                try:
+                    batch_status = batch_processor.get_status_summary()
+                    batch_progress = batch_processor.progress
+                    
+                    # Enhanced batch results formatting
+                    if hasattr(batch_progress, 'total_images') and batch_progress.total_images > 0:
+                        # Progress percentage and timing
+                        percentage = getattr(batch_progress, 'progress_percentage', 0)
+                        elapsed = getattr(batch_progress, 'elapsed_time', 0)
+                        eta = getattr(batch_progress, 'estimated_time_remaining', 0)
+                        
+                        results_summary = f"📊 Batch Progress Summary\n"
+                        results_summary += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        results_summary += f"📁 Total Images: {batch_progress.total_images}\n"
+                        results_summary += f"✅ Processed: {batch_progress.processed_images}\n"
+                        results_summary += f"⏭️ Skipped: {len(getattr(batch_progress, 'skipped', []))}\n"
+                        results_summary += f"❌ Errors: {len(getattr(batch_progress, 'errors', []))}\n"
+                        results_summary += f"📈 Progress: {percentage:.1f}%\n"
+                        results_summary += f"⏱️ Elapsed: {elapsed:.1f}s"
+                        
+                        if eta > 0:
+                            eta_text = f"{eta/60:.1f}min" if eta > 60 else f"{eta:.0f}s"
+                            results_summary += f" | ETA: {eta_text}"
+                        
+                        # Current image being processed
+                        current_image = getattr(batch_progress, 'current_image', None)
+                        if current_image:
+                            results_summary += f"\n🔄 Current: {current_image}"
+                        
+                        # Recent errors
+                        errors = getattr(batch_progress, 'errors', [])
+                        if errors:
+                            results_summary += f"\n\n❌ Recent Errors:"
+                            for error in errors[-3:]:  # Show last 3 errors
+                                results_summary += f"\n  • {error}"
+                        
+                        # Skipped files
+                        skipped = getattr(batch_progress, 'skipped', [])
+                        if skipped and len(skipped) <= 5:
+                            results_summary += f"\n\n⏭️ Skipped Files:"
+                            for skip in skipped:
+                                results_summary += f"\n  • {skip}"
+                        elif len(skipped) > 5:
+                            results_summary += f"\n\n⏭️ Skipped Files: {len(skipped)} files (check console for details)"
+                            
+                    else:
+                        results_summary = "🚀 Ready for batch processing\n"
+                        results_summary += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        results_summary += "Select input and output folders to begin"
+                    
+                    # Enhanced status formatting
+                    is_running = getattr(batch_processor, 'is_running', False)
+                    if is_running:
+                        if hasattr(batch_progress, 'total_images') and batch_progress.total_images > 0:
+                            detailed_status = f"🔄 {batch_status}\n"
+                            detailed_status += f"Processing: {batch_progress.processed_images}/{batch_progress.total_images} images"
+                            current_image = getattr(batch_progress, 'current_image', None)
+                            if current_image:
+                                detailed_status += f"\nCurrent: {current_image}"
+                        else:
+                            detailed_status = f"🔄 {batch_status}"
+                    else:
+                        detailed_status = f"⏸️ {batch_status}"
+                    
+                    # Show cancel button when processing
+                    show_cancel = is_running or "processing" in global_status.lower()
+                    
+                    return (global_status, detailed_status, results_summary,
+                           gr.Button(visible=show_cancel), gr.Button(visible=not show_cancel))
+                           
+                except Exception as batch_e:
+                    print(f"⚠️ Batch processor status error: {batch_e}")
+                    # Fallback to simple status
+                    show_cancel = "processing" in global_status.lower()
+                    return (global_status, "⚠️ Batch processor status unavailable", "Batch processor initialized but status unavailable",
+                           gr.Button(visible=show_cancel), gr.Button(visible=not show_cancel))
+            else:
+                show_cancel = "processing" in global_status.lower()
+                return (global_status, "❌ Batch processor not available", "⚠️ Batch processor not initialized",
+                       gr.Button(visible=show_cancel), gr.Button(visible=not show_cancel))
+                
+        except Exception as e:
+            error_msg = f"❌ Error updating status: {str(e)}"
+            print(error_msg)
+            import traceback
+            traceback.print_exc()
+            return (error_msg, "❌ Status Error", "Status update failed - check console",
+                   gr.Button(visible=False), gr.Button(visible=False))
+    
+    # Batch processing event handlers
+    batch_start_btn.click(
+        fn=start_batch_processing_ui,
+        inputs=[
+            batch_input_folder, batch_output_folder, batch_skip_existing, batch_use_current_settings,
+            seed, ss_guidance_strength, ss_sampling_steps,
+            slat_guidance_strength, slat_sampling_steps, poly_count_slider,
+            xatlas_max_cost_slider, xatlas_normal_seam_weight_slider, xatlas_resolution_slider, xatlas_padding_slider,
+            normal_map_resolution_slider, normal_match_input_res_checkbox,
+            auto_save_obj_cb, auto_save_glb_cb, auto_save_ply_cb, auto_save_stl_cb
+        ],
+        outputs=[processing_status_text, batch_status_text, batch_results_text, batch_start_btn, universal_cancel_btn],
+        show_progress=True
+    )
+    
+    # Universal cancel button (works for both single and batch)
+    universal_cancel_btn.click(
+        fn=cancel_processing_ui,
+        inputs=[],
+        outputs=[processing_status_text, batch_status_text, batch_results_text, batch_start_btn, universal_cancel_btn]
+    )
+    
+    batch_cancel_btn.click(
+        fn=cancel_processing_ui,
+        inputs=[],
+        outputs=[processing_status_text, batch_status_text, batch_results_text, batch_start_btn, universal_cancel_btn]
+    )
+    
+    # Initial status update on demo load
+    demo.load(
+        fn=update_processing_status,
+        inputs=[],
+        outputs=[processing_status_text, batch_status_text, batch_results_text, universal_cancel_btn, batch_start_btn]
+    )
+    
+    # Add system validation to demo load for debugging
+    demo.load(
+        fn=lambda: print(validate_system_integration()),
+        inputs=[],
+        outputs=[]
+    )
+    
+    # Cleanup function for proper shutdown
+    def cleanup_processing_system():
+        """Cleanup function to ensure proper resource management"""
+        global processing_core, batch_processor, cancellation_manager, hi3dgen_pipeline
+        
+        try:
+            print("🧹 Cleaning up processing system...")
+            
+            # Cancel any active processing
+            if cancellation_manager:
+                try:
+                    cancellation_manager.request_cancellation("System shutdown")
+                    print("  ✓ Cancellation requested")
+                except Exception as e:
+                    print(f"  ⚠️ Error during cancellation: {e}")
+            
+            # Cleanup batch processor
+            if batch_processor and hasattr(batch_processor, 'cleanup'):
+                try:
+                    batch_processor.cleanup()
+                    print("  ✓ Batch processor cleaned up")
+                except Exception as e:
+                    print(f"  ⚠️ Error cleaning batch processor: {e}")
+            
+            # Cleanup processing core
+            if processing_core and hasattr(processing_core, 'cleanup'):
+                try:
+                    processing_core.cleanup()
+                    print("  ✓ Processing core cleaned up")
+                except Exception as e:
+                    print(f"  ⚠️ Error cleaning processing core: {e}")
+            
+            # Move pipeline to CPU and clear GPU memory
+            if hi3dgen_pipeline:
+                try:
+                    hi3dgen_pipeline.cpu()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print("  ✓ GPU memory cleared")
+                except Exception as e:
+                    print(f"  ⚠️ Error clearing GPU memory: {e}")
+            
+            print("🧹 Cleanup completed")
+            
+        except Exception as e:
+            print(f"❌ Error during cleanup: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Register cleanup function
+    import atexit
+    atexit.register(cleanup_processing_system)
 
 if __name__ =="__main__":
 
@@ -751,6 +1388,80 @@ if __name__ =="__main__":
     hi3dgen_pipeline =Hi3DGenPipeline .from_pretrained (trellis_local_path )
     hi3dgen_pipeline .cpu ()
     print ("Hi3DGenPipeline loaded on CPU.")
+
+    print ("Initializing processing system...")
+    print (f"  System Info:")
+    print (f"    - WEIGHTS_DIR: {WEIGHTS_DIR}")
+    print (f"    - TMP_DIR: {TMP_DIR}")
+    print (f"    - MAX_SEED: {MAX_SEED}")
+    print (f"    - CUDA Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print (f"    - CUDA Device: {torch.cuda.get_device_name()}")
+        print (f"    - CUDA Memory: {torch.cuda.get_device_properties(0).total_memory // 1024**3} GB")
+    
+    try:
+        # Validate prerequisites
+        if hi3dgen_pipeline is None:
+            raise RuntimeError("Hi3DGenPipeline not loaded")
+        if not os.path.exists(WEIGHTS_DIR):
+            raise RuntimeError(f"Weights directory not found: {WEIGHTS_DIR}")
+        if not os.path.exists(TMP_DIR):
+            os.makedirs(TMP_DIR, exist_ok=True)
+            print(f"Created TMP_DIR: {TMP_DIR}")
+        
+        # Initialize ProcessingCore
+        processing_core = ProcessingCore(
+            hi3dgen_pipeline=hi3dgen_pipeline,
+            weights_dir=WEIGHTS_DIR,
+            tmp_dir=TMP_DIR,
+            max_seed=MAX_SEED
+        )
+        print ("✓ ProcessingCore initialized successfully.")
+        
+        # Initialize BatchProcessor
+        batch_processor = create_batch_processor(processing_core)
+        print ("✓ BatchProcessor initialized successfully.")
+        
+        # Initialize cancellation manager
+        cancellation_manager = get_cancellation_manager()
+        print ("✓ Cancellation manager initialized successfully.")
+        
+        # Verify integration
+        assert processing_core is not None, "ProcessingCore initialization failed"
+        assert batch_processor is not None, "BatchProcessor initialization failed"
+        assert cancellation_manager is not None, "Cancellation manager initialization failed"
+        
+        print ("🚀 Processing system ready and verified!")
+        
+        # Print comprehensive system status if available
+        if SYSTEM_STATUS_AVAILABLE:
+            print ("\n" + "="*60)
+            print_system_status(
+                processing_core=processing_core,
+                batch_processor=batch_processor,
+                hi3dgen_pipeline=hi3dgen_pipeline,
+                weights_dir=WEIGHTS_DIR,
+                tmp_dir=TMP_DIR
+            )
+            print ("="*60)
+        else:
+            print("\n🚀 System ready with basic monitoring")
+            print(f"✓ ProcessingCore: {'Available' if processing_core else 'Not Available'}")
+            print(f"✓ BatchProcessor: {'Available' if batch_processor else 'Not Available'}")
+            print(f"✓ CancellationManager: {'Available' if cancellation_manager else 'Not Available'}")
+            print(f"✓ Hi3DGen Pipeline: {'Available' if hi3dgen_pipeline else 'Not Available'}")
+            print(f"✓ GPU Support: {'Available' if torch.cuda.is_available() else 'Not Available'}")
+        
+    except Exception as e:
+        print (f"❌ Error initializing processing system: {e}")
+        import traceback
+        traceback.print_exc()
+        print ("⚠️ Some features may not work properly.")
+        
+        # Set globals to None to prevent errors
+        processing_core = None
+        batch_processor = None
+        cancellation_manager = None
 
     parser = argparse.ArgumentParser(description="Run the Hi3DGen Gradio App.")
     parser.add_argument('--share', action='store_true', help='Enable Gradio sharing')
