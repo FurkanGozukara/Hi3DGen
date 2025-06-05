@@ -878,6 +878,12 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                         normal_output =gr .Image (label ="Normal Bridge",image_mode ="RGBA",type ="pil")
                     with gr .Row ():
                         gen_shape_btn =gr .Button ("Generate Shape",size ="lg",variant ="primary")
+                    with gr .Row ():
+                        auto_save_obj_cb =gr .Checkbox (value =True ,label ="Auto-save OBJ",info ="Wavefront OBJ format")
+                        auto_save_glb_cb =gr .Checkbox (value =True ,label ="Auto-save GLB",info ="Binary glTF format")
+                    with gr .Row ():
+                        auto_save_ply_cb =gr .Checkbox (value =True ,label ="Auto-save PLY",info ="Stanford Triangle format")
+                        auto_save_stl_cb =gr .Checkbox (value =True ,label ="Auto-save STL",info ="Stereolithography format")
 
                 with gr .Tab ("📦 Batch Processing"):
                     with gr .Row ():
@@ -1016,7 +1022,7 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                 )
 
             with gr .Column ():
-                model_output =gr .Model3D (label ="3D Model Preview (Each model is approximately 40MB, may take around 1 minute to load)")
+                model_output =gr .Model3D (label ="3D Model Preview (Each model is approximately 40MB, may take around 1 minute to load)",height=768)
             with gr .Column ():
                 export_format =gr .Dropdown (
                 choices =["obj","glb","ply","stl"],
@@ -1026,14 +1032,6 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                 download_btn =gr .DownloadButton (label ="Export Mesh",interactive =False )
 
                 open_folder_btn =gr .Button ("📁 Open Outputs Folder",variant ="primary")
-
-                gr .Markdown ("#### Auto-Save Settings")
-                with gr .Row ():
-                    auto_save_obj_cb =gr .Checkbox (value =True ,label ="Auto-save OBJ",info ="Wavefront OBJ format")
-                    auto_save_glb_cb =gr .Checkbox (value =True ,label ="Auto-save GLB",info ="Binary glTF format")
-                with gr .Row ():
-                    auto_save_ply_cb =gr .Checkbox (value =True ,label ="Auto-save PLY",info ="Stanford Triangle format")
-                    auto_save_stl_cb =gr .Checkbox (value =True ,label ="Auto-save STL",info ="Stereolithography format")
                 
                 gr .Markdown ("#### 📋 Preset Management")
                 with gr .Row ():
