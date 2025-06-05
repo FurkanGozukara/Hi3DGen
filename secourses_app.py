@@ -865,7 +865,7 @@ footer {visibility: hidden}
 
 with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     gr .Markdown (
-    "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V12 with Auto-Save : https://www.patreon.com/posts/130766890"
+    "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V15 with Auto-Save : https://www.patreon.com/posts/130766890"
     )
 
     with gr .Row ():
@@ -877,7 +877,14 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                         image_prompt =gr .Image (label ="Image Prompt",image_mode ="RGBA",type ="pil")
                         normal_output =gr .Image (label ="Normal Bridge",image_mode ="RGBA",type ="pil")
                     with gr .Row ():
-                        gen_shape_btn =gr .Button ("Generate Shape",size ="lg",variant ="primary")
+                        gen_shape_btn =gr .Button ("Generate 3D Mesh",size ="lg",variant ="primary")
+                    with gr .Row ():
+                        processing_status_text =gr .Textbox (
+                label ="Processing Status",
+                value ="Idle",
+                interactive =False ,
+                scale =2 
+                )
                     with gr .Row ():
                         auto_save_obj_cb =gr .Checkbox (value =True ,label ="Auto-save OBJ",info ="Wavefront OBJ format")
                         auto_save_glb_cb =gr .Checkbox (value =True ,label ="Auto-save GLB",info ="Binary glTF format")
@@ -950,6 +957,9 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                             elem_id ="parameter-guide-content"
                             )
 
+
+                            
+
             with gr .Accordion ("Advanced Settings",open =True ):
                 seed =gr .Slider (-1 ,MAX_SEED ,label ="Seed",value =0 ,step =1 )
                 gr .Markdown ("#### Stage 1: Sparse Structure Generation")
@@ -1014,14 +1024,19 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                 variant ="stop",
                 visible =False 
                 )
-                processing_status_text =gr .Textbox (
-                label ="Processing Status",
-                value ="Idle",
-                interactive =False ,
-                scale =2 
-                )
+
 
             with gr .Column ():
+                with gr .Row ():
+                    display_mode_dropdown = gr .Dropdown (
+                        choices =["solid", "point_cloud", "wireframe"],
+                        value ="solid",
+                        label ="Display Mode",
+                        info ="Choose how to display the 3D model",
+                        scale =2
+                    )
+                    display_mode_btn = gr .Button ("Update Display", variant ="secondary", scale =1)
+                
                 model_output =gr .Model3D (label ="3D Model Preview (Each model is approximately 40MB, may take around 1 minute to load)",height=768)
             with gr .Column ():
                 export_format =gr .Dropdown (
@@ -1029,7 +1044,7 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                 value ="glb",
                 label ="File Format"
                 )
-                download_btn =gr .DownloadButton (label ="Export Mesh",interactive =False )
+                download_btn =gr .DownloadButton (label ="Download 3D Mesh",interactive =False )
 
                 open_folder_btn =gr .Button ("📁 Open Outputs Folder",variant ="primary")
                 
@@ -1091,6 +1106,14 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     outputs =[image_prompt ]
     )
 
+    def update_global_model_path_after_generation(normal_image, model_path, download_path):
+        """Update the global model path when a new model is generated."""
+        global current_model_path_global
+        if model_path:
+            current_model_path_global = model_path
+            print(f"Updated global model path to: {model_path}")
+        return normal_image, model_path, download_path
+
     gen_shape_btn .click (
     generate_3d_with_cancellation ,
     inputs =[
@@ -1112,9 +1135,82 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     outputs =[normal_output ,model_output ,download_btn ],
     show_progress =True 
     ).then (
+    fn=update_global_model_path_after_generation,
+    inputs=[normal_output, model_output, download_btn],
+    outputs=[normal_output, model_output, download_btn]
+    ).then (
     lambda :gr .Button (interactive =True ),
     outputs =[download_btn ],
     )
+
+
+
+    # Global variable to store the current model path for display mode changes
+    current_model_path_global = None
+
+    def store_model_path_and_clear_viewer(current_model_path: str, selected_display_mode: str):
+        """Store the current model path and clear the viewer."""
+        global current_model_path_global
+        current_model_path_global = current_model_path
+        
+        if not current_model_path:
+            print("No model loaded, updating display mode only")
+            return gr.Model3D(
+                value=None,
+                label=f"3D Model Preview - {selected_display_mode.title()} Mode (No model loaded)",
+                display_mode=selected_display_mode,
+                height=768
+            )
+        
+        print(f"Storing model path and clearing viewer for display mode: {selected_display_mode}")
+        
+        # Clear the viewer first (step 1 of delete/reload simulation)
+        return gr.Model3D(
+            value=None,
+            label=f"3D Model Preview - {selected_display_mode.title()} Mode (Refreshing...)",
+            display_mode=selected_display_mode,
+            height=768
+        )
+
+    def reload_3d_viewer_with_display_mode(selected_display_mode: str):
+        """Reload the 3D viewer with the stored model and new display mode."""
+        import time
+        global current_model_path_global
+        
+        try:
+            # Small delay to ensure the clear operation is processed
+            time.sleep(0.1)
+            
+            if not current_model_path_global:
+                print("No stored model to reload")
+                return gr.Model3D(
+                    value=None,
+                    label=f"3D Model Preview - {selected_display_mode.title()} Mode (No model loaded)",
+                    display_mode=selected_display_mode,
+                    height=768
+                )
+            
+            print(f"Reloading 3D viewer with stored model: {current_model_path_global} and display mode: {selected_display_mode}")
+            
+            # Now reload with the stored model and new display mode (step 2 of delete/reload simulation)
+            return gr.Model3D(
+                value=current_model_path_global,
+                label=f"3D Model Preview - {selected_display_mode.title()} Mode (Each model is approximately 40MB, may take around 1 minute to load)",
+                display_mode=selected_display_mode,
+                height=768
+            )
+            
+        except Exception as e:
+            print(f"Error reloading 3D viewer: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return fallback state
+            return gr.Model3D(
+                value=current_model_path_global,
+                label="3D Model Preview - Error reloading",
+                display_mode="solid",
+                height=768
+            )
 
     def prepare_download_file (mesh_path_from_model_output :str ,selected_format :str ):
 
@@ -1141,7 +1237,7 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
 
         if not mesh_path_from_model_output :
 
-            return gr .DownloadButton (interactive =False ,label ="Export Mesh")
+            return gr .DownloadButton (interactive =False ,label ="Download 3D Mesh")
 
         path_for_download =prepare_download_file (mesh_path_from_model_output ,selected_format )
 
@@ -1151,12 +1247,34 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
             return gr .DownloadButton (value =path_for_download ,interactive =True ,label =f"Download {selected_format.upper()}")
         else :
             print (f"update_download_button: Conversion failed for {selected_format}, button inactive.")
-            return gr .DownloadButton (interactive =False ,label ="Export Mesh")
+            return gr .DownloadButton (interactive =False ,label ="Download 3D Mesh")
 
     export_format .change (
     update_download_button ,
     inputs =[model_output ,export_format ],
     outputs =[download_btn ]
+    )
+
+    # Display mode change handlers - using two-step process to simulate delete/reload
+    display_mode_btn .click (
+    fn =store_model_path_and_clear_viewer ,
+    inputs =[model_output ,display_mode_dropdown ],
+    outputs =[model_output ]
+    ).then (
+    fn =reload_3d_viewer_with_display_mode ,
+    inputs =[display_mode_dropdown ],
+    outputs =[model_output ]
+    )
+    
+    # Also update on dropdown change for immediate feedback
+    display_mode_dropdown .change (
+    fn =store_model_path_and_clear_viewer ,
+    inputs =[model_output ,display_mode_dropdown ],
+    outputs =[model_output ]
+    ).then (
+    fn =reload_3d_viewer_with_display_mode ,
+    inputs =[display_mode_dropdown ],
+    outputs =[model_output ]
     )
 
     open_folder_btn .click (
