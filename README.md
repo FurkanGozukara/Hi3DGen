@@ -9,6 +9,21 @@
 
 [![image](https://cdn-uploads.huggingface.co/production/uploads/6345bd89fe134dfd7a0dba40/EzyVg24MA6gwEObcXG4yj.png)](https://youtu.be/HjbD20B2C1g)
 
+![1](https://github.com/user-attachments/assets/a42e4004-de30-4639-8c6c-d274a93d9a99)
+
+![2](https://github.com/user-attachments/assets/62b9a395-e0ff-4922-a1b9-86f3659133de)
+
+![3](https://github.com/user-attachments/assets/87433de9-f43d-4d97-becd-14e67a12c370)
+
+![7](https://github.com/user-attachments/assets/10683c17-0828-43e0-a02e-60d7f6b598d9)
+
+![4](https://github.com/user-attachments/assets/e6ed6b58-1d60-42e0-bbc2-8b418882969e)
+
+![5](https://github.com/user-attachments/assets/8bfea15b-5935-4762-9f07-a2656fcefaa9)
+
+![6](https://github.com/user-attachments/assets/95c31fd3-1523-4953-a661-aace3ee1cdc9)
+
+
 Hi3DGen is the newest state of the art image to 3D mesh generation model. In this tutorial I will show you step by step how to install and use this amazing open source AI model to generate the very best 3D meshes from static images and use in your projects.
 
 ## Video Chapters
