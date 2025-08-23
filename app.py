@@ -271,6 +271,95 @@ def unwrap_mesh_with_xatlas(input_mesh: trimesh.Trimesh) -> trimesh.Trimesh:
 
 
 
+def generate_3d_multi(images, seed=-1,  
+                      ss_guidance_strength=3, ss_sampling_steps=50,
+                      slat_guidance_strength=3, slat_sampling_steps=6,
+                      poly_count_pcnt: float = 0.5,
+                      mode='multidiffusion'):
+    """Generate 3D model from multiple input images"""
+    global hi3dgen_pipeline
+
+    if not images or len(images) == 0: 
+        print("No input images provided. Aborting generation.")
+        return None, None, None
+    
+    # Filter out None images
+    valid_images = [img for img in images if img is not None]
+    if len(valid_images) == 0:
+        print("No valid input images provided. Aborting generation.")
+        return None, None, None
+        
+    print(f"Processing {len(valid_images)} images in {mode} mode...")
+    
+    if seed == -1: 
+        seed = np.random.randint(0, MAX_SEED)
+    
+    if hi3dgen_pipeline is None:
+        print("FATAL: Hi3DGenPipeline not loaded. Cannot generate 3D.")
+        return None, None, None 
+
+    gradio_model_path = None 
+    
+    # 3D Generation using multi-image pipeline
+    pipeline_on_gpu = False
+    try:
+        if torch.cuda.is_available():
+            print("Multi-Image 3D Generation: Moving Hi3DGen pipeline to GPU...")
+            hi3dgen_pipeline.cuda()
+            pipeline_on_gpu = True
+        
+        print(f"Multi-Image 3D Generation: Running Hi3DGen pipeline with {len(valid_images)} images...")
+        outputs = hi3dgen_pipeline.run_multi_image(
+            valid_images, 
+            seed=seed, 
+            formats=["mesh"], 
+            preprocess_image=True,
+            mode=mode,
+            sparse_structure_sampler_params={"steps": ss_sampling_steps, "cfg_strength": ss_guidance_strength},
+            slat_sampler_params={"steps": slat_sampling_steps, "cfg_strength": slat_guidance_strength},
+        )
+        
+        timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+        output_dir = os.path.join(TMP_DIR, timestamp)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        mesh_path_glb = os.path.join(output_dir, "mesh.glb")
+
+        raw_mesh_trimesh = outputs['mesh'][0].to_trimesh(transform_pose=True)
+        mesh_for_uv_unwrap = simplify_mesh_open3d(raw_mesh_trimesh, poly_count_pcnt)
+        
+        # Call the new UV unwrapping function
+        unwrapped_mesh_trimesh = unwrap_mesh_with_xatlas(mesh_for_uv_unwrap)
+        
+        # Export GLB
+        print(f"Exporting GLB to {mesh_path_glb}...")
+        unwrapped_mesh_trimesh.export(mesh_path_glb) 
+        print(f"SUCCESS: Multi-image GLB exported.")
+
+        gradio_model_path = mesh_path_glb 
+
+    except Exception as e:
+        print(f"ERROR in Multi-Image 3D Generation stage: {e}")
+        traceback.print_exc() 
+        gradio_model_path = None 
+    finally:
+        if pipeline_on_gpu: 
+            print("Multi-Image 3D Generation: Moving Hi3DGen pipeline to CPU...")
+            hi3dgen_pipeline.cpu() 
+            if torch.cuda.is_available(): 
+                torch.cuda.empty_cache()
+            
+    # For multi-image, we return the first preprocessed image as the "normal" preview
+    first_preprocessed = None
+    if valid_images:
+        try:
+            first_preprocessed = hi3dgen_pipeline.preprocess_image(valid_images[0])
+        except Exception as e:
+            print(f"Warning: Could not preprocess first image for preview: {e}")
+            
+    return first_preprocessed, gradio_model_path, gradio_model_path
+
+
 def generate_3d(image, seed=-1,  
                 ss_guidance_strength=3, ss_sampling_steps=50,
                 slat_guidance_strength=3, slat_sampling_steps=6,
@@ -360,6 +449,49 @@ def generate_3d(image, seed=-1,
             
     return normal_image_pil, gradio_model_path, gradio_model_path
 
+
+
+def process_multi_image_upload(files):
+    """Process multiple uploaded image files"""
+    if not files:
+        return [], None
+    
+    images = []
+    preview_images = []
+    
+    for file in files:
+        try:
+            # Load image
+            img = Image.open(file.name)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            images.append(img)
+            preview_images.append(img)
+            print(f"Loaded image: {file.name} ({img.size})")
+        except Exception as e:
+            print(f"Error loading image {file.name}: {e}")
+            continue
+    
+    print(f"Successfully loaded {len(images)} images for multi-image processing")
+    return preview_images, images
+
+
+def preprocess_multi_images(images_list):
+    """Preprocess multiple images for generation"""
+    if not images_list:
+        return []
+    
+    processed_images = []
+    for img in images_list:
+        try:
+            if img is not None:
+                processed = preprocess_image(img)
+                if processed is not None:
+                    processed_images.append(processed)
+        except Exception as e:
+            print(f"Error preprocessing image: {e}")
+    
+    return processed_images
 
 
 def convert_mesh(mesh_path: str, export_format: str) -> Optional[str]:
@@ -453,7 +585,32 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
                         normal_output = gr.Image(label="Normal Bridge", image_mode="RGBA", type="pil")
                         
                 with gr.Tab("Multiple Images"):
-                    gr.Markdown("<div style='text-align: center; padding: 40px; font-size: 24px;'>Multiple Images functionality is coming soon!</div>")
+                    gr.Markdown("### Upload multiple angle views of your object (2-8 images recommended)")
+                    with gr.Row():
+                        with gr.Column():
+                            multi_image_inputs = gr.File(
+                                label="Upload Multiple Images", 
+                                file_count="multiple",
+                                file_types=["image"],
+                                height=200
+                            )
+                            with gr.Row():
+                                multi_mode = gr.Radio(
+                                    choices=["multidiffusion", "stochastic"], 
+                                    value="multidiffusion",
+                                    label="Processing Mode",
+                                    info="MultiDiffusion: Average all views (recommended). Stochastic: Cycle through views."
+                                )
+                        with gr.Column():
+                            multi_preview = gr.Gallery(
+                                label="Preview Images", 
+                                show_label=True,
+                                elem_id="multi_preview",
+                                columns=3,
+                                rows=2,
+                                height=200
+                            )
+                            multi_normal_output = gr.Image(label="Preprocessed First Image", image_mode="RGBA", type="pil")
                         
             with gr.Accordion("Advanced Settings", open=False):
                 seed = gr.Slider(-1, MAX_SEED, label="Seed", value=0, step=1)
@@ -468,7 +625,8 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
                     
             with gr.Group():
                 with gr.Row():
-                    gen_shape_btn = gr.Button("Generate Shape", size="lg", variant="primary")
+                    gen_shape_btn = gr.Button("Generate from Single Image", size="lg", variant="primary")
+                    gen_multi_shape_btn = gr.Button("Generate from Multiple Images", size="lg", variant="secondary")
                         
         # Right column - Output
         with gr.Column(scale=1):
@@ -496,6 +654,30 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
             slat_guidance_strength, slat_sampling_steps
         ],
         outputs=[normal_output, model_output, download_btn]
+    ).then(
+        lambda: gr.Button(interactive=True),
+        outputs=[download_btn],
+    )
+    
+    # Multi-image event handlers
+    multi_image_inputs.upload(
+        process_multi_image_upload,
+        inputs=[multi_image_inputs],
+        outputs=[multi_preview, gr.State()]
+    )
+    
+    gen_multi_shape_btn.click(
+        lambda files, seed_val, ss_strength, ss_steps, slat_strength, slat_steps, mode: 
+            generate_3d_multi(
+                [Image.open(f.name) for f in files] if files else [],
+                seed_val, ss_strength, ss_steps, slat_strength, slat_steps, 0.5, mode
+            ) if files else (None, None, None),
+        inputs=[
+            multi_image_inputs, seed,
+            ss_guidance_strength, ss_sampling_steps,
+            slat_guidance_strength, slat_sampling_steps, multi_mode
+        ],
+        outputs=[multi_normal_output, model_output, download_btn]
     ).then(
         lambda: gr.Button(interactive=True),
         outputs=[download_btn],
@@ -535,6 +717,34 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
         ],
         inputs=image_prompt,
     )
+    
+    # Create multi-image examples by grouping the example_multi_image files
+    multi_image_examples = []
+    multi_image_dir = "assets/example_multi_image"
+    if os.path.exists(multi_image_dir):
+        # Group by object name (everything before the last underscore and number)
+        grouped_images = {}
+        for filename in os.listdir(multi_image_dir):
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                # Extract object name (e.g., 'character' from 'character_1.png')
+                base_name = '_'.join(filename.split('_')[:-1])
+                if base_name not in grouped_images:
+                    grouped_images[base_name] = []
+                grouped_images[base_name].append(os.path.join(multi_image_dir, filename))
+        
+        # Create example sets (each set is a list of 3 images for one object)
+        for obj_name, image_paths in grouped_images.items():
+            if len(image_paths) >= 2:  # At least 2 images
+                # Sort to ensure consistent order
+                image_paths.sort()
+                multi_image_examples.append(image_paths[:3])  # Take first 3 images
+    
+    if multi_image_examples:
+        multi_examples = gr.Examples(
+            examples=multi_image_examples,
+            inputs=multi_image_inputs,
+            label="Multi-view Example Sets"
+        )
 
     gr.Markdown(
         """

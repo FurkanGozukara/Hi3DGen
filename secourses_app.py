@@ -717,6 +717,103 @@ progress =gr .Progress ()):
         except :
             pass 
 
+def generate_3d_multi_with_cancellation(files, mode="multidiffusion", seed=-1, 
+                                       ss_guidance_strength=3, ss_sampling_steps=50,
+                                       slat_guidance_strength=3, slat_sampling_steps=6,
+                                       poly_count_pcnt=0.5, xatlas_max_cost=8.0,
+                                       xatlas_normal_seam_weight=1.0, xatlas_resolution=1024,
+                                       xatlas_padding=2, normal_map_resolution=768,
+                                       normal_match_input_resolution=True,
+                                       auto_save_obj=True, auto_save_glb=True,
+                                       auto_save_ply=True, auto_save_stl=True,
+                                       progress=gr.Progress()):
+    """Generate 3D model from multiple input images - minimal wrapper using existing pipeline"""
+    from PIL import Image
+    
+    if not files or len(files) == 0:
+        print("No input images provided for multi-image generation.")
+        return None, None, None
+    
+    # Load images from uploaded files
+    images = []
+    for file in files:
+        try:
+            img = Image.open(file.name)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            images.append(img)
+        except Exception as e:
+            print(f"Error loading image {file.name}: {e}")
+            continue
+    
+    if len(images) == 0:
+        print("No valid images loaded for multi-image generation.")
+        return None, None, None
+    
+    print(f"Processing {len(images)} images in {mode} mode...")
+    progress(0.1, desc=f"Loaded {len(images)} images")
+    
+    # Use existing pipeline's run_multi_image method directly
+    global hi3dgen_pipeline
+    if seed == -1:
+        seed = np.random.randint(0, MAX_SEED)
+    
+    try:
+        if torch.cuda.is_available():
+            progress(0.2, desc="Moving pipeline to GPU...")
+            hi3dgen_pipeline.cuda()
+        
+        progress(0.3, desc="Running multi-image Hi3DGen pipeline...")
+        outputs = hi3dgen_pipeline.run_multi_image(
+            images,
+            seed=seed,
+            formats=["mesh"],
+            preprocess_image=True,
+            mode=mode,
+            sparse_structure_sampler_params={"steps": ss_sampling_steps, "cfg_strength": ss_guidance_strength},
+            slat_sampler_params={"steps": slat_sampling_steps, "cfg_strength": slat_guidance_strength},
+        )
+        
+        progress(0.7, desc="Processing mesh...")
+        # Reuse existing mesh processing
+        timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+        output_dir = os.path.join(TMP_DIR, timestamp)
+        os.makedirs(output_dir, exist_ok=True)
+        mesh_path_glb = os.path.join(output_dir, "mesh.glb")
+        
+        raw_mesh_trimesh = outputs['mesh'][0].to_trimesh(transform_pose=True)
+        mesh_for_uv_unwrap = simplify_mesh_open3d(raw_mesh_trimesh, poly_count_pcnt)
+        unwrapped_mesh_trimesh = unwrap_mesh_with_xatlas(
+            mesh_for_uv_unwrap,
+            max_cost_param=xatlas_max_cost,
+            normal_seam_weight_param=xatlas_normal_seam_weight,
+            resolution_param=xatlas_resolution,
+            padding_param=xatlas_padding
+        )
+        unwrapped_mesh_trimesh.export(mesh_path_glb)
+        
+        progress(0.9, desc="Auto-saving files...")
+        # Reuse existing auto-save system
+        if any([auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl]):
+            enabled_formats = {
+                "obj": auto_save_obj, "glb": auto_save_glb, 
+                "ply": auto_save_ply, "stl": auto_save_stl
+            }
+            first_preprocessed = hi3dgen_pipeline.preprocess_image(images[0]) if images else None
+            auto_save_generation(mesh_path_glb, first_preprocessed, enabled_formats)
+        
+        progress(1.0, desc="✅ Multi-image generation completed")
+        return first_preprocessed, mesh_path_glb, mesh_path_glb
+        
+    except Exception as e:
+        progress(0.0, desc=f"❌ Multi-image generation failed: {str(e)}")
+        print(f"Multi-image generation error: {e}")
+        return None, None, None
+    finally:
+        if torch.cuda.is_available():
+            hi3dgen_pipeline.cpu()
+            torch.cuda.empty_cache()
+
 def convert_mesh (mesh_path :str ,export_format :str )->Optional [str ]:
 
     if not mesh_path or not os .path .exists (mesh_path ):
@@ -865,7 +962,7 @@ footer {visibility: hidden}
 
 with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     gr .Markdown (
-    "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V15 with Auto-Save : https://www.patreon.com/posts/130766890"
+    "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V16 with Auto-Save : https://www.patreon.com/posts/130766890"
     )
 
     with gr .Row ():
@@ -891,6 +988,50 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                     with gr .Row ():
                         auto_save_ply_cb =gr .Checkbox (value =True ,label ="Auto-save PLY",info ="Stanford Triangle format")
                         auto_save_stl_cb =gr .Checkbox (value =True ,label ="Auto-save STL",info ="Stereolithography format")
+
+                with gr .Tab ("🎭 Multiple Images"):
+                    gr .Markdown ("### Upload multiple angle views of your object (2-8 images recommended)")
+                    with gr .Row ():
+                        with gr .Column ():
+                            multi_image_inputs =gr .File (
+                                label ="Upload Multiple Images",
+                                file_count ="multiple",
+                                file_types =["image"],
+                                height =200 
+                            )
+                            with gr .Row ():
+                                multi_mode =gr .Radio (
+                                    choices =["multidiffusion","stochastic"],
+                                    value ="multidiffusion",
+                                    label ="Processing Mode",
+                                    info ="MultiDiffusion: Average all views (recommended). Stochastic: Cycle through views."
+                                )
+                            multi_gen_btn =gr .Button ("Generate 3D from Multiple Images",size ="lg",variant ="primary")
+                        with gr .Column ():
+                            multi_preview =gr .Gallery (
+                                label ="Preview Images",
+                                show_label =True ,
+                                elem_id ="multi_preview",
+                                columns =3 ,
+                                rows =2 ,
+                                height =200 
+                            )
+                            multi_normal_output =gr .Image (label ="Preprocessed First Image",image_mode ="RGBA",type ="pil")
+                    
+                    with gr .Row ():
+                        multi_processing_status_text =gr .Textbox (
+                        label ="Multi-Image Processing Status",
+                        value ="Idle",
+                        interactive =False ,
+                        scale =2 
+                        )
+                    
+                    with gr .Row ():
+                        multi_auto_save_obj_cb =gr .Checkbox (value =True ,label ="Auto-save OBJ",info ="Wavefront OBJ format")
+                        multi_auto_save_glb_cb =gr .Checkbox (value =True ,label ="Auto-save GLB",info ="Binary glTF format")
+                    with gr .Row ():
+                        multi_auto_save_ply_cb =gr .Checkbox (value =True ,label ="Auto-save PLY",info ="Stanford Triangle format")
+                        multi_auto_save_stl_cb =gr .Checkbox (value =True ,label ="Auto-save STL",info ="Stereolithography format")
 
                 with gr .Tab ("📦 Batch Processing"):
                     with gr .Row ():
@@ -1099,6 +1240,29 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
                 inputs =image_prompt ,
                 examples_per_page =96 
                 )
+                
+                # Multi-image examples - reuse existing example_multi_image folder
+                if os .path .exists ("assets/example_multi_image"):
+                    multi_image_examples = []
+                    grouped_images = {}
+                    for filename in os .listdir ("assets/example_multi_image"):
+                        if filename .lower ().endswith (('.png', '.jpg', '.jpeg')):
+                            base_name = '_'.join (filename .split ('_')[:-1 ])
+                            if base_name not in grouped_images:
+                                grouped_images [base_name] = []
+                            grouped_images [base_name].append (f'assets/example_multi_image/{filename}')
+                    
+                    for obj_name, image_paths in grouped_images .items ():
+                        if len (image_paths) >= 2:
+                            image_paths .sort ()
+                            multi_image_examples .append (image_paths [:3 ])
+                    
+                    if multi_image_examples:
+                        multi_examples = gr .Examples (
+                            examples =multi_image_examples,
+                            inputs =multi_image_inputs,
+                            label ="Multi-view Example Sets"
+                        )
 
     image_prompt .upload (
     preprocess_image ,
@@ -1143,7 +1307,58 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     outputs =[download_btn ],
     )
 
+    # Multi-image event handlers - minimal implementation
+    def process_multi_image_upload(files):
+        """Simple file upload processor"""
+        from PIL import Image
+        if not files:
+            return [], "No files uploaded"
+        
+        images = []
+        for f in files:
+            try:
+                img = Image.open(f.name)
+                images.append(img)
+            except Exception as e:
+                print(f"Error loading image {f.name}: {e}")
+                continue
+        
+        return images, f"Loaded {len(images)} images"
 
+    multi_image_inputs .upload (
+        process_multi_image_upload,
+        inputs =[multi_image_inputs],
+        outputs =[multi_preview, multi_processing_status_text]
+    )
+
+    multi_gen_btn .click (
+        generate_3d_multi_with_cancellation,
+        inputs =[
+            multi_image_inputs, multi_mode, seed,
+            ss_guidance_strength, ss_sampling_steps,
+            slat_guidance_strength, slat_sampling_steps,
+            poly_count_slider,
+            xatlas_max_cost_slider,
+            xatlas_normal_seam_weight_slider,
+            xatlas_resolution_slider,
+            xatlas_padding_slider,
+            normal_map_resolution_slider,
+            normal_match_input_res_checkbox,
+            multi_auto_save_obj_cb,
+            multi_auto_save_glb_cb,
+            multi_auto_save_ply_cb,
+            multi_auto_save_stl_cb
+        ],
+        outputs =[multi_normal_output, model_output, download_btn],
+        show_progress =True
+    ).then (
+        fn=update_global_model_path_after_generation,
+        inputs=[multi_normal_output, model_output, download_btn],
+        outputs=[multi_normal_output, model_output, download_btn]
+    ).then (
+        lambda :gr .Button (interactive =True ),
+        outputs =[download_btn ],
+    )
 
     # Global variable to store the current model path for display mode changes
     current_model_path_global = None
