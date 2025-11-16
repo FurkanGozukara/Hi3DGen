@@ -45,17 +45,21 @@ class Pipeline:
     @staticmethod
     def from_pretrained(path: str) -> "Pipeline":
         """
-        Load a pretrained model.
+        Load a pretrained model from local path only.
+        Does NOT download from HuggingFace - all models must be pre-downloaded.
         """
         import os
         import json
-        is_local = os.path.exists(f"{path}/pipeline.json")
-
-        if is_local:
-            config_file = f"{path}/pipeline.json"
-        else:
-            from huggingface_hub import hf_hub_download
-            config_file = hf_hub_download(path, "pipeline.json")
+        
+        # Only support local paths
+        config_file = f"{path}/pipeline.json"
+        
+        if not os.path.exists(config_file):
+            raise FileNotFoundError(
+                f"Pipeline configuration not found at: {config_file}\n"
+                f"Expected a local path with pipeline.json file.\n"
+                f"Please ensure models are downloaded using DownloadModels.py"
+            )
 
         with open(config_file, 'r') as f:
             args = json.load(f)['args']

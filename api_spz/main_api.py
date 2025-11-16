@@ -62,7 +62,8 @@ parser.add_argument("--port", type=int, default=7960, help="Port to bind the ser
 # Default model_path assumes it's an HF ID or a path relative to where the script is run,
 # but we will resolve it against WEIGHTS_DIR if it looks like an HF ID.
 parser.add_argument("--model_path", type=str, default="Stable-X/trellis-normal-v0-1", help="Hi3DGen pipeline model path (HF ID or local path)")
-parser.add_argument("--normal_predictor_repo", type=str, default="hugoycj/StableNormal", help="torch.hub repo for normal predictor.")
+# Use local paths for offline operation
+parser.add_argument("--normal_predictor_repo", type=str, default=None, help="torch.hub repo for normal predictor (defaults to local weights directory)")
 parser.add_argument("--normal_predictor_model", type=str, default="StableNormal_turbo", help="Model name for normal predictor.")
 parser.add_argument("--normal_predictor_yoso", type=str, default="yoso-normal-v1-8-1", help="YOSO version for normal predictor.")
 # --weights_cache_dir is now effectively determined by WEIGHTS_DIR above.
@@ -77,6 +78,11 @@ final_weights_dir = Path(args.override_weights_cache_dir) if args.override_weigh
 final_weights_dir.mkdir(parents=True, exist_ok=True)
 logger.info(f"Using weights directory: {final_weights_dir.resolve()}")
 
+# Auto-resolve normal_predictor_repo to local path if not specified
+if args.normal_predictor_repo is None:
+    args.normal_predictor_repo = str(final_weights_dir / "github--hugoycj--StableNormal")
+    logger.info(f"Using local StableNormal at: {args.normal_predictor_repo}")
+
 
 # Print startup information
 print("\n" + "="*50)
@@ -87,17 +93,11 @@ print("Touching this window will pause it. If it happens, click inside it and pr
 print("="*50 + "\n")
 
 
-def cache_weights_api(weights_dir_path: Path) -> dict:
+def verify_weights_api(weights_dir_path: Path) -> dict:
     """
-    Ensures specified models are cached locally. Adapted for API startup.
-    Uses the per-file download approach for better progress visibility.
+    Verify that all required models are present in the weights directory.
+    Does NOT download anything - all models must be pre-downloaded using DownloadModels.py
     """
-    # This import is here because hf_transfer might not be a hard dependency for all users
-    # and we enable it via environment variable.
-    from huggingface_hub import list_repo_files, hf_hub_download
-
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1" # Attempt to use hf-transfer
-
     model_ids = [
         "Stable-X/trellis-normal-v0-1", # For Hi3DGenPipeline
         "Stable-X/yoso-normal-v1-8-1",  # For YOSONormals (used by StableNormal_turbo)
@@ -105,43 +105,40 @@ def cache_weights_api(weights_dir_path: Path) -> dict:
     ]
     cached_paths_map = {}
 
-    logger.info("Starting model caching process...")
+    logger.info("Verifying locally cached models...")
+    all_present = True
+
     for repo_id in model_ids:
-        # Define the target local directory using Hugging Face's standard cache structure format.
         local_repo_root = weights_dir_path / f"models--{repo_id.replace('/', '--')}"
-        logger.info(f"Processing {repo_id} for caching into {local_repo_root}...")
-        sys.stdout.flush() # Ensure log appears
-        local_repo_root.mkdir(parents=True, exist_ok=True)
-
-        try:
-            files_in_repo = list_repo_files(repo_id=repo_id, repo_type="model")
-            num_total_files = len(files_in_repo)
-            logger.info(f"  Found {num_total_files} files in {repo_id}. Starting download/verification...")
-            sys.stdout.flush()
-
-            for i, filename_in_repo in enumerate(files_in_repo):
-                # Print progress before each file operation
-                logger.info(f"  [{i+1}/{num_total_files}] Processing file: {filename_in_repo}")
-                sys.stdout.flush()
-                try:
-                    hf_hub_download(
-                        repo_id=repo_id,
-                        filename=filename_in_repo,
-                        repo_type="model",
-                        local_dir=str(local_repo_root),
-                        force_download=False, # Only downloads if not present or outdated
-                    )
-                except Exception as file_e:
-                    # Log individual file errors but continue for other files/repos
-                    logger.warning(f"    Skipping {filename_in_repo} due to: {str(file_e)[:100]}...")
-                    pass # Continue with the next file
-            
+        
+        if local_repo_root.exists():
+            logger.info(f"  ✅ Found: {repo_id} at {local_repo_root}")
             cached_paths_map[repo_id] = str(local_repo_root)
-            logger.info(f"  Finished processing {repo_id}.")
-        except Exception as repo_e:
-            logger.error(f"  ERROR processing repository {repo_id}: {repo_e}")
-        sys.stdout.flush()
-    logger.info("Model caching process completed.")
+        else:
+            logger.error(f"  ❌ MISSING: {repo_id} (expected at {local_repo_root})")
+            all_present = False
+    
+    # Check GitHub repos
+    github_repos = [
+        ("hugoycj", "StableNormal"),
+        ("facebookresearch", "dinov2"),
+    ]
+    
+    for github_user, repo_name in github_repos:
+        local_repo_root = weights_dir_path / f"github--{github_user}--{repo_name}"
+        if local_repo_root.exists():
+            logger.info(f"  ✅ Found: {github_user}/{repo_name} at {local_repo_root}")
+        else:
+            logger.error(f"  ❌ MISSING: {github_user}/{repo_name} (expected at {local_repo_root})")
+            all_present = False
+    
+    if not all_present:
+        logger.warning("⚠️  Some models are missing. Please run DownloadModels.py to download them.")
+        logger.warning("   The API will attempt to proceed but may fail if models are missing.")
+    else:
+        logger.info("✅ All models verified and present locally!")
+    
+    sys.stdout.flush()
     return cached_paths_map
 
 
@@ -170,14 +167,14 @@ def reduce_uvicorn_logs():
 async def lifespan(app_instance: FastAPI): # Renamed app to app_instance to avoid conflict
     logger.info("Server lifespan startup sequence initiated.")
 
-    cache_weights_api(final_weights_dir) # Use the determined final_weights_dir
+    verify_weights_api(final_weights_dir) # Verify all models are present locally
 
     final_device_name = args.device
     if final_device_name is None:
         final_device_name = "cuda" if torch.cuda.is_available() else "cpu"
    
     # Resolve actual Hi3DGen model path (it might be an HF ID or a local path)
-    # `cache_weights_api` ensures HF IDs are downloaded to final_weights_dir.
+    # Models must be pre-downloaded using DownloadModels.py
     resolved_hi3dgen_model_path = args.model_path
     if not Path(args.model_path).is_dir(): # If it's not already a local directory path
         # Assume it's an HF ID; construct its expected local cache path
@@ -187,13 +184,11 @@ async def lifespan(app_instance: FastAPI): # Renamed app to app_instance to avoi
             resolved_hi3dgen_model_path = str(potential_local_path)
             logger.info(f"Resolved Hi3DGen model ID '{args.model_path}' to local cache: {resolved_hi3dgen_model_path}")
         else:
-            # This case should ideally not happen if cache_weights_api worked for this model_id.
-            # Or, model_path might be a relative local path that's not yet absolute.
-            logger.warning(f"Hi3DGen model_path '{args.model_path}' is not an existing directory. "
-                           f"If it's an HF ID, its cache path '{potential_local_path}' was not found after caching. "
-                           f"Attempting to load '{args.model_path}' directly.")
-            # Hi3DGenPipeline.from_pretrained will attempt to load it. If it's an HF ID not locally cached,
-            # it might try to download (undesirable if we want all downloads via cache_weights_api).
+            # Model not found - user must run DownloadModels.py
+            logger.error(f"Hi3DGen model_path '{args.model_path}' is not an existing directory. "
+                        f"Expected local cache path '{potential_local_path}' was not found. "
+                        f"Please run DownloadModels.py to download required models.")
+            raise FileNotFoundError(f"Model not found: {args.model_path}. Run DownloadModels.py first.")
 
     state.initialize_pipeline(
         model_path=resolved_hi3dgen_model_path,

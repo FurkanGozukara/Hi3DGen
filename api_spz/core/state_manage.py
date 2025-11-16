@@ -70,19 +70,26 @@ class Hi3DGenState:
             self._set_eval_mode(self.pipeline, "Hi3DGenPipeline")
             logger.info("Hi3DGenPipeline loaded to CPU and configured.")
 
-            # 2. Load Normal Predictor to CPU
+            # 2. Load Normal Predictor to CPU (local only - no downloads)
             is_local_repo = Path(normal_predictor_repo).is_dir() and \
                             Path(normal_predictor_repo, "hubconf.py").exists()
-            hub_source_type = 'local' if is_local_repo else 'github'
             
-            logger.info(f"Loading Normal Predictor '{normal_predictor_model}' from '{normal_predictor_repo}' (source: {hub_source_type}) to CPU. Cache dir: {weights_cache_dir}")
+            if not is_local_repo:
+                raise FileNotFoundError(
+                    f"Normal Predictor repository not found at: {normal_predictor_repo}\n"
+                    f"Expected a local directory with hubconf.py.\n"
+                    f"Please ensure models are downloaded using DownloadModels.py\n"
+                    f"Expected path: {Path(weights_cache_dir) / 'github--hugoycj--StableNormal'}"
+                )
+            
+            logger.info(f"Loading Normal Predictor '{normal_predictor_model}' from local repo '{normal_predictor_repo}' to CPU. Cache dir: {weights_cache_dir}")
             
             # torch.hub.load loads the model wrapper. The wrapper's __init__ might try to move its internal model to CUDA.
             # We want to control this. For now, we load it and then immediately ensure its internal model is on CPU if possible.
             self.normal_predictor = torch.hub.load(
                 repo_or_dir=normal_predictor_repo,
                 model=normal_predictor_model,
-                source=hub_source_type,
+                source='local',  # Force local source only
                 trust_repo=True, 
                 yoso_version=yoso_version,
                 local_cache_dir=weights_cache_dir,

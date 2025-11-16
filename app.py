@@ -54,60 +54,54 @@ hi3dgen_pipeline = None
 normal_predictor = None
 
 
-def cache_weights(weights_dir: str) -> dict:
+def verify_weights(weights_dir: str) -> dict:
+    """
+    Verify that all required models are present in the weights directory.
+    Does NOT download anything - all models must be pre-downloaded.
+    """
     import os
     import sys
-    from huggingface_hub import list_repo_files, hf_hub_download
     from pathlib import Path
 
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1" # Attempt to use hf-transfer
-
-    model_ids = [ # Renamed for brevity
+    model_ids = [
         "Stable-X/trellis-normal-v0-1", "Stable-X/yoso-normal-v1-8-1", "ZhengPeng7/BiRefNet"
     ]
-    cached_paths = {} # Renamed for brevity
+    cached_paths = {}
 
-    for repo_id in model_ids: # Renamed for clarity (Hugging Face term)
+    print("Verifying locally cached models...")
+    all_present = True
+
+    for repo_id in model_ids:
         local_repo_root = Path(weights_dir) / f"models--{repo_id.replace('/', '--')}"
-        print(f"Processing {repo_id} into {local_repo_root}...")
-        sys.stdout.flush()
-        local_repo_root.mkdir(parents=True, exist_ok=True)
-
-        try:
-            # Get all file paths within the repository
-            files_in_repo = list_repo_files(repo_id=repo_id, repo_type="model")
-            num_total_files = len(files_in_repo)
-            print(f"  Found {num_total_files} files. Starting download/verification...")
-            sys.stdout.flush()
-
-            for i, filename_in_repo in enumerate(files_in_repo):
-                # Print progress before each file operation
-                print(f"  [{i+1}/{num_total_files}] Processing: {filename_in_repo}")
-                sys.stdout.flush()
-                try:
-                    # hf_hub_download handles caching internally.
-                    # It downloads to a shared HF cache then copies/symlinks to local_dir if specified.
-                    # We specify local_dir to ensure files land directly in our target structure.
-                    hf_hub_download(
-                        repo_id=repo_id,
-                        filename=filename_in_repo,
-                        repo_type="model",
-                        local_dir=str(local_repo_root), # Ensures download into the model's specific folder
-                        local_dir_use_symlinks=False, # Force copy, not symlink
-                        force_download=False, # Only downloads if not present or outdated in cache/local_dir
-                    )
-                except Exception as file_e:
-                    # Silently skip individual file errors (e.g., if it's a directory entry or unresolvable)
-                    # More robust error handling would log this or retry. For compactness, we skip.
-                    # print(f"    Warning: Skipping {filename_in_repo} due to: {str(file_e)[:50]}...") # Optional: short error
-                    pass
-            
+        
+        if local_repo_root.exists():
+            print(f"  ✅ Found: {repo_id} at {local_repo_root}")
             cached_paths[repo_id] = str(local_repo_root)
-            print(f"  Finished processing {repo_id}.")
-        except Exception as repo_e:
-            print(f"  ERROR processing repository {repo_id}: {repo_e}")
-        sys.stdout.flush()
-
+        else:
+            print(f"  ❌ MISSING: {repo_id} (expected at {local_repo_root})")
+            all_present = False
+    
+    # Check GitHub repos
+    github_repos = [
+        ("hugoycj", "StableNormal"),
+        ("facebookresearch", "dinov2"),
+    ]
+    
+    for github_user, repo_name in github_repos:
+        local_repo_root = Path(weights_dir) / f"github--{github_user}--{repo_name}"
+        if local_repo_root.exists():
+            print(f"  ✅ Found: {github_user}/{repo_name} at {local_repo_root}")
+        else:
+            print(f"  ❌ MISSING: {github_user}/{repo_name} (expected at {local_repo_root})")
+            all_present = False
+    
+    if not all_present:
+        print("\n⚠️  Some models are missing. Please run DownloadModels.py to download them.")
+        print("   The app will attempt to proceed but may fail if models are missing.")
+    else:
+        print("\n✅ All models verified and present locally!")
+    
+    sys.stdout.flush()
     return cached_paths
 
 
@@ -381,9 +375,11 @@ def generate_3d(image, seed=-1,
     # --- STAGE 1: Normal Prediction ---
     current_normal_predictor_instance = None 
     try:
-        print("Normal Prediction: Loading model...") 
+        print("Normal Prediction: Loading model from local cache...") 
+        # Use local StableNormal model from weights directory
+        stablenormal_local_path = os.path.join(WEIGHTS_DIR, "github--hugoycj--StableNormal")
         current_normal_predictor_instance = torch.hub.load(
-            "hugoycj/StableNormal", "StableNormal_turbo", trust_repo=True, 
+            stablenormal_local_path, "StableNormal_turbo", source='local', trust_repo=True, 
             yoso_version='yoso-normal-v1-8-1', local_cache_dir=WEIGHTS_DIR
         )
         print("Normal Prediction: Generating normal map...")
@@ -757,11 +753,13 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
     )
 
 if __name__ == "__main__":
-    # Download and cache the weights
-    cache_weights(WEIGHTS_DIR)
+    # Verify that all models are present locally
+    verify_weights(WEIGHTS_DIR)
 
     print("Loading Hi3DGenPipeline to CPU...")
-    hi3dgen_pipeline = Hi3DGenPipeline.from_pretrained("weights/trellis-normal-v0-1")
+    # Use the correct local path for trellis model
+    trellis_model_path = os.path.join(WEIGHTS_DIR, "models--Stable-X--trellis-normal-v0-1")
+    hi3dgen_pipeline = Hi3DGenPipeline.from_pretrained(trellis_model_path)
     hi3dgen_pipeline.cpu() # Move to CPU after loading
     print("Hi3DGenPipeline loaded on CPU.")
 

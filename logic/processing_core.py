@@ -288,12 +288,16 @@ class ProcessingCore:
             if should_cancel():
                 return None
             
-            # Load normal predictor
-            update_progress("Normal Prediction", "Loading YOSO model")
+            # Load normal predictor from local cache
+            update_progress("Normal Prediction", "Loading YOSO model from local cache")
             yoso_model_abs_path = os.path.abspath(yoso_local_path)
             
+            # Use local StableNormal model from weights directory
+            weights_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'weights')
+            stablenormal_local_path = os.path.join(weights_dir, "github--hugoycj--StableNormal")
+            
             current_normal_predictor_instance = torch.hub.load(
-                "hugoycj/StableNormal", "StableNormal_turbo", trust_repo=True,
+                stablenormal_local_path, "StableNormal_turbo", source='local', trust_repo=True,
                 yoso_version=yoso_model_abs_path
             )
             

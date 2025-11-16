@@ -58,56 +58,54 @@ processing_core =None
 batch_processor =None 
 cancellation_manager =None 
 
-def cache_weights (weights_dir :str )->dict :
+def verify_weights (weights_dir :str )->dict :
+    """
+    Verify that all required models are present in the weights directory.
+    Does NOT download anything - all models must be pre-downloaded.
+    """
     import os 
     import sys 
-    from huggingface_hub import list_repo_files ,hf_hub_download 
     from pathlib import Path 
-
-    os .environ ["HF_HUB_ENABLE_HF_TRANSFER"]="1"
 
     model_ids =[
     "Stable-X/trellis-normal-v0-1","Stable-X/yoso-normal-v1-8-1","ZhengPeng7/BiRefNet"
     ]
     cached_paths ={}
 
+    print ("Verifying locally cached models...")
+    all_present =True 
+
     for repo_id in model_ids :
         local_repo_root =Path (weights_dir )/f"models--{repo_id.replace('/', '--')}"
-        print (f"Processing {repo_id} into {local_repo_root}...")
-        sys .stdout .flush ()
-        local_repo_root .mkdir (parents =True ,exist_ok =True )
-
-        try :
-
-            files_in_repo =list_repo_files (repo_id =repo_id ,repo_type ="model")
-            num_total_files =len (files_in_repo )
-            print (f"  Found {num_total_files} files. Starting download/verification...")
-            sys .stdout .flush ()
-
-            for i ,filename_in_repo in enumerate (files_in_repo ):
-
-                print (f"  [{i+1}/{num_total_files}] Processing: {filename_in_repo}")
-                sys .stdout .flush ()
-                try :
-
-                    hf_hub_download (
-                    repo_id =repo_id ,
-                    filename =filename_in_repo ,
-                    repo_type ="model",
-                    local_dir =str (local_repo_root ),
-                    local_dir_use_symlinks =False ,
-                    force_download =False ,
-                    )
-                except Exception as file_e :
-
-                    pass 
-
+        
+        if local_repo_root .exists ():
+            print (f"  ✅ Found: {repo_id} at {local_repo_root}")
             cached_paths [repo_id ]=str (local_repo_root )
-            print (f"  Finished processing {repo_id}.")
-        except Exception as repo_e :
-            print (f"  ERROR processing repository {repo_id}: {repo_e}")
-        sys .stdout .flush ()
-
+        else :
+            print (f"  ❌ MISSING: {repo_id} (expected at {local_repo_root})")
+            all_present =False 
+    
+    # Check GitHub repos
+    github_repos =[
+        ("hugoycj", "StableNormal"),
+        ("facebookresearch", "dinov2"),
+    ]
+    
+    for github_user ,repo_name in github_repos :
+        local_repo_root =Path (weights_dir )/f"github--{github_user}--{repo_name}"
+        if local_repo_root .exists ():
+            print (f"  ✅ Found: {github_user}/{repo_name} at {local_repo_root}")
+        else :
+            print (f"  ❌ MISSING: {github_user}/{repo_name} (expected at {local_repo_root})")
+            all_present =False 
+    
+    if not all_present :
+        print ("\n⚠️  Some models are missing. Please run DownloadModels.py to download them.")
+        print ("   The app will attempt to proceed but may fail if models are missing.")
+    else :
+        print ("\n✅ All models verified and present locally!")
+    
+    sys .stdout .flush ()
     return cached_paths 
 
 def preprocess_mesh (mesh_prompt ):
@@ -962,7 +960,7 @@ footer {visibility: hidden}
 
 with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
     gr .Markdown (
-    "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V16 with Auto-Save : https://www.patreon.com/posts/130766890"
+    "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V17 with Auto-Save : https://www.patreon.com/posts/130766890"
     )
 
     with gr .Row ():
@@ -2211,8 +2209,8 @@ with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
 
 if __name__ =="__main__":
 
-    print ("Caching model weights...")
-    cached_paths =cache_weights (WEIGHTS_DIR )
+    print ("Verifying model weights...")
+    cached_paths =verify_weights (WEIGHTS_DIR )
 
     global_cached_paths =cached_paths 
 

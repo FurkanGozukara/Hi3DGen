@@ -90,12 +90,35 @@ class Hi3DGenPipeline(Pipeline):
     
     def _init_image_cond_model(self, name: str):
         """
-        Initialize the image conditioning model.
+        Initialize the image conditioning model from local cache only.
         """
-        try:
-            dinov2_model = torch.hub.load(os.path.join(torch.hub.get_dir(), 'facebookresearch_dinov2_main'), name, source='local',pretrained=True)
-        except:
-            dinov2_model = torch.hub.load('facebookresearch/dinov2', name, pretrained=True)
+        import os
+        
+        # First, check in our custom weights directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(current_dir))
+        weights_dir = os.path.join(project_root, 'weights')
+        local_dinov2_path = os.path.join(weights_dir, "github--facebookresearch--dinov2")
+        
+        if os.path.exists(local_dinov2_path):
+            print(f"Loading DINOv2 from local weights: {local_dinov2_path}")
+            dinov2_model = torch.hub.load(local_dinov2_path, name, source='local', pretrained=True)
+        else:
+            # Fallback to torch.hub cache directory
+            hub_dir = torch.hub.get_dir()
+            torch_hub_dinov2_path = os.path.join(hub_dir, 'facebookresearch_dinov2_main')
+            if os.path.exists(torch_hub_dinov2_path):
+                print(f"Loading DINOv2 from torch hub cache: {torch_hub_dinov2_path}")
+                dinov2_model = torch.hub.load(torch_hub_dinov2_path, name, source='local', pretrained=True)
+            else:
+                raise FileNotFoundError(
+                    f"DINOv2 model not found in local cache.\n"
+                    f"Expected locations:\n"
+                    f"  1. {local_dinov2_path}\n"
+                    f"  2. {torch_hub_dinov2_path}\n"
+                    f"Please run DownloadModels.py to download required models."
+                )
+        
         dinov2_model.eval()
         self.models['image_cond_model'] = dinov2_model
         transform = transforms.Compose([
@@ -204,12 +227,10 @@ class Hi3DGenPipeline(Pipeline):
         return output
 
     def _lazy_load_birefnet(self):
-        """Lazy loading of the BiRefNet model"""
+        """Lazy loading of the BiRefNet model from local cache only"""
         from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation, AutoModelForImageSegmentation
         
-        # Try to use local cached model first, then fallback to HF
         import os
-        birefnet_local_path = None
         
         # Check for local cached model in weights directory
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -218,23 +239,32 @@ class Hi3DGenPipeline(Pipeline):
         local_birefnet_path = os.path.join(weights_dir, "models--ZhengPeng7--BiRefNet")
         
         if os.path.exists(local_birefnet_path):
-            birefnet_local_path = local_birefnet_path
-            print(f"BiRefNet: Using local cached model at {birefnet_local_path}")
+            print(f"BiRefNet: Using local cached model at {local_birefnet_path}")
+            self.birefnet_model = AutoModelForImageSegmentation.from_pretrained(
+                local_birefnet_path,
+                trust_remote_code=True,
+                local_files_only=True  # Prevent downloading
+            ).to(self.device)
         else:
-            # Fallback to HuggingFace cache or direct download
+            # Check HuggingFace cache as fallback
             hf_cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
             hf_birefnet_path = os.path.join(hf_cache_dir, "models--ZhengPeng7--BiRefNet")
             if os.path.exists(hf_birefnet_path):
-                birefnet_local_path = hf_birefnet_path
-                print(f"BiRefNet: Using HuggingFace cached model at {birefnet_local_path}")
+                print(f"BiRefNet: Using HuggingFace cached model at {hf_birefnet_path}")
+                self.birefnet_model = AutoModelForImageSegmentation.from_pretrained(
+                    hf_birefnet_path,
+                    trust_remote_code=True,
+                    local_files_only=True  # Prevent downloading
+                ).to(self.device)
             else:
-                birefnet_local_path = 'ZhengPeng7/BiRefNet'
-                print(f"BiRefNet: Using HuggingFace repository {birefnet_local_path}")
+                raise FileNotFoundError(
+                    f"BiRefNet model not found in local cache.\n"
+                    f"Expected locations:\n"
+                    f"  1. {local_birefnet_path}\n"
+                    f"  2. {hf_birefnet_path}\n"
+                    f"Please run DownloadModels.py to download required models."
+                )
         
-        self.birefnet_model = AutoModelForImageSegmentation.from_pretrained(
-            birefnet_local_path,
-            trust_remote_code=True
-        ).to(self.device)
         self.birefnet_model.eval()
     
     def reset_birefnet_state(self):
