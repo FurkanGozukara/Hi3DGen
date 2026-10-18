@@ -492,7 +492,7 @@ class ProcessingCore:
         if isinstance(error, torch.cuda.OutOfMemoryError) or "out of memory" in str(error).lower():
             print("The GPU ran out of memory. Set the model memory mode to 'Offload' (Performance settings) "
                   "or close other programs that use the GPU, then try again.")
-            self.memory.free_gpu_memory(quiet=True)
+            self.memory.note_out_of_memory()
 
     # ------------------------------------------------------------------------------------------
     # CPU part

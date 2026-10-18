@@ -36,6 +36,7 @@ class ModelMemory:
         self.weights_dir = Path(weights_dir)
         self._predictor = None
         self._lock = threading.RLock()
+        self._out_of_memory = False  # set when 'auto' ran out of GPU memory: it then offloads for the rest of the session
         self.mode = "auto"
         self.set_mode(mode or os.environ.get("HI3DGEN_MODEL_MEMORY", "auto"))
 
@@ -46,6 +47,7 @@ class ModelMemory:
             print(f"Model memory: unknown mode '{mode}', using 'auto'")
             mode = "auto"
         self.mode = mode
+        self._out_of_memory = False
         self._apply_policy()
         return self.mode
 
@@ -71,7 +73,18 @@ class ModelMemory:
             return True
         if self.mode == "offload":
             return False
-        return self.total_vram_gb() >= RESIDENT_MIN_VRAM_GB
+        return self.total_vram_gb() >= RESIDENT_MIN_VRAM_GB and not self._out_of_memory
+
+    def note_out_of_memory(self):
+        """The GPU ran out of memory: give everything back, and in 'auto' stop keeping the models on the GPU (another
+        program probably uses it too). 'keep' stays as the user chose it."""
+        if self.mode == "auto" and not self._out_of_memory:
+            self._out_of_memory = True
+            print("Model memory: the GPU ran out of memory, the models are moved to the CPU after each stage from now on "
+                  "(Performance -> Model memory: keep brings the old behaviour back).")
+        if self.pipeline is not None:
+            self.pipeline.birefnet_keep_on_gpu = self.resident
+        self.free_gpu_memory(quiet=True)
 
     def _apply_policy(self):
         if self.pipeline is not None:
