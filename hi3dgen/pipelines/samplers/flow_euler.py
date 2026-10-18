@@ -29,6 +29,7 @@ from tqdm import tqdm
 from .base import Sampler
 from .classifier_free_guidance_mixin import ClassifierFreeGuidanceSamplerMixin
 from .guidance_interval_mixin import GuidanceIntervalSamplerMixin
+from .progress import notify_step
 
 
 class FlowEulerSampler(Sampler):
@@ -131,11 +132,13 @@ class FlowEulerSampler(Sampler):
         t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = {"samples": None, "pred_x_t": [], "pred_x_0": []}
-        for t, t_prev in tqdm(t_pairs, desc="Sampling", disable=not verbose):
+        for step, (t, t_prev) in enumerate(tqdm(t_pairs, desc="Sampling", disable=not verbose)):
+            notify_step(step, steps)  # progress + cooperative cancel (no-op unless the app installed a callback)
             out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
             sample = out["pred_x_prev"]
             ret["pred_x_t"].append(out["pred_x_prev"])
             ret["pred_x_0"].append(out["pred_x_0"])
+        notify_step(steps, steps)
         ret["samples"] = sample
         return ret
 

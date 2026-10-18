@@ -310,11 +310,21 @@ class SparseFeatures2Mesh:
         self.res = res
         self.mesh_extractor = EnhancedMarchingCubes(device=device)
         self.sdf_bias = -1.0 / res
-        verts, cube = construct_dense_grid(self.res, self.device)
-        self.reg_c = cube.to(self.device)
-        self.reg_v = verts.to(self.device)
+        # The dense grid vertices are built on first use, on the device that is used, and released with clear_cache().
+        # (The dense cube index table that used to be built here was never read and held ~1 GB of GPU memory.)
+        self._reg_v = None
         self.use_color = use_color
         self._calc_layout()
+
+    def get_reg_v(self, device):
+        device = torch.device(device)
+        if self._reg_v is None or self._reg_v.device != device:
+            self._reg_v = construct_dense_grid_verts(self.res, device)
+        return self._reg_v
+
+    def clear_cache(self):
+        """Release the dense grid (it is rebuilt on the next call)."""
+        self._reg_v = None
 
     def _calc_layout(self):
         LAYOUTS = {
@@ -360,7 +370,7 @@ class SparseFeatures2Mesh:
             sdf_d, deform_d = v_attrs_d[..., 0], v_attrs_d[..., 1:4]
             colors_d = None
 
-        x_nx3 = get_defomed_verts(self.reg_v, deform_d, self.res)
+        x_nx3 = get_defomed_verts(self.get_reg_v(deform_d.device), deform_d, self.res)
 
         vertices, faces, L_dev, colors = self.mesh_extractor(
             voxelgrid_vertices=x_nx3,

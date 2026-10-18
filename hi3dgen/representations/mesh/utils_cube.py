@@ -40,6 +40,13 @@ def construct_dense_grid(res, device='cuda'):
     return verts, cube_fx8
 
 
+def construct_dense_grid_verts(res, device='cuda'):
+    '''vertices of the dense grid, identical to the first return value of construct_dense_grid (without the cube table)'''
+    res_v = res + 1
+    vertsid = torch.arange(res_v ** 3, device=device)
+    return torch.stack([vertsid // (res_v ** 2), (vertsid // res_v) % res_v, vertsid % res_v], dim=1)
+
+
 def construct_voxel_grid(coords):
     verts = (cube_corners.unsqueeze(0).to(coords) + coords.unsqueeze(1)).reshape(-1, 3)
     verts_unique, inverse_indices = torch.unique(verts, dim=0, return_inverse=True)

@@ -31,6 +31,7 @@
 # This modified file is released under the same license.
 from typing import *
 from contextlib import contextmanager
+import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,6 +42,39 @@ from PIL import Image
 from .base import Pipeline
 from . import samplers
 from ..modules import sparse as sp
+
+
+# torch.hub name of the image encoder -> checkpoint file DownloadModels.py stores in weights/
+DINOV2_WEIGHT_FILES = {
+    "dinov2_vitl14_reg": "dinov2_vitl14_reg4_pretrain.pth",
+}
+
+# The BiRefNet model is shared: one background removal at a time (an upload may happen while a multi-image job runs)
+_BIREFNET_LOCK = threading.RLock()
+
+
+def _prepare_dinov2_attention():
+    """DINOv2 runs its attention in fp32 and uses xformers whenever xformers imports.
+
+    xformers only ships fp16/bf16 flash kernels and cutlass kernels up to compute capability 9.0, so on newer GPUs
+    (RTX 50 series) fp32 attention has no kernel and the first generation would fail. Probe once; when the kernel is
+    missing, DINOv2 falls back to its own attention (same fp32 math). Must run before DINOv2 is first imported.
+    """
+    import os
+
+    if "XFORMERS_DISABLED" in os.environ:
+        return
+    try:
+        if not torch.cuda.is_available():
+            raise RuntimeError("no CUDA device")
+        import xformers.ops as xops
+
+        probe = torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.float32)
+        xops.memory_efficient_attention(probe, probe, probe)
+        torch.cuda.synchronize()
+    except Exception as exc:
+        os.environ["XFORMERS_DISABLED"] = "1"
+        print(f"[DINOv2] xformers fp32 attention is not available here ({type(exc).__name__}); DINOv2 uses its built-in attention.")
 
 
 class Hi3DGenPipeline(Pipeline):
@@ -88,21 +122,37 @@ class Hi3DGenPipeline(Pipeline):
 
         return new_pipeline
     
+    def to(self, device) -> None:
+        super().to(device)
+        if torch.device(device).type != "cuda":
+            # the mesh decoder keeps its dense marching-cubes grid on the GPU: release it with the models
+            extractor = getattr(self.models.get('slat_decoder_mesh'), 'mesh_extractor', None)
+            if extractor is not None and hasattr(extractor, 'clear_cache'):
+                extractor.clear_cache()
+
     def _init_image_cond_model(self, name: str):
         """
         Initialize the image conditioning model from local cache only.
         """
         import os
-        
+
         # First, check in our custom weights directory
         current_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(os.path.dirname(current_dir))
         weights_dir = os.path.join(project_root, 'weights')
         local_dinov2_path = os.path.join(weights_dir, "github--facebookresearch--dinov2")
-        
+
         if os.path.exists(local_dinov2_path):
             print(f"Loading DINOv2 from local weights: {local_dinov2_path}")
-            dinov2_model = torch.hub.load(local_dinov2_path, name, source='local', pretrained=True)
+            _prepare_dinov2_attention()
+            weights_file = os.path.join(weights_dir, DINOV2_WEIGHT_FILES.get(name, f"{name}_pretrain.pth"))
+            if os.path.isfile(weights_file):
+                # Same checkpoint torch.hub would download, read from the weights folder (no network at start).
+                dinov2_model = torch.hub.load(local_dinov2_path, name, source='local', pretrained=False)
+                dinov2_model.load_state_dict(torch.load(weights_file, map_location='cpu', weights_only=True), strict=True)
+            else:
+                print(f"DINOv2 weights not found at {weights_file}; downloading them now (run DownloadModels.py to fetch them up front).")
+                dinov2_model = torch.hub.load(local_dinov2_path, name, source='local', pretrained=True)
         else:
             # Fallback to torch.hub cache directory
             hub_dir = torch.hub.get_dir()
@@ -126,10 +176,13 @@ class Hi3DGenPipeline(Pipeline):
         ])
         self.image_cond_model_transform = transform
 
-    def preprocess_image(self, input: Image.Image, resolution=518) -> Image.Image:
+    def preprocess_image(self, input: Image.Image, resolution=518, device=None) -> Image.Image:
         """
         Preprocess the input image using BiRefNet for background removal.
         Includes padding to maintain aspect ratio when resizing to 518x518.
+
+        `device="cpu"` removes the background on the CPU (for when a generation is using the GPU); by default the GPU
+        is used when there is one.
         """
         # if has alpha channel, use it directly
         has_alpha = False
@@ -147,21 +200,22 @@ class Hi3DGenPipeline(Pipeline):
             if scale < 1:
                 input = input.resize((int(input.width * scale), int(input.height * scale)), Image.Resampling.LANCZOS)
             
-            # Load BiRefNet model if not already loaded
-            if getattr(self, 'birefnet_model', None) is None:
-                try:
-                    print("BiRefNet: Loading model for preprocessing...")
-                    self._lazy_load_birefnet()
-                except Exception as e:
-                    print(f"BiRefNet: Error during lazy loading: {e}")
-                    # Reset state and try once more
-                    self.reset_birefnet_state()
-                    print("BiRefNet: Retrying after state reset...")
-                    self._lazy_load_birefnet()
-            
-            # Get mask using BiRefNet
-            mask = self._get_birefnet_mask(input)
-            
+            with _BIREFNET_LOCK:
+                # Load BiRefNet model if not already loaded
+                if getattr(self, 'birefnet_model', None) is None:
+                    try:
+                        print("BiRefNet: Loading model for preprocessing...")
+                        self._lazy_load_birefnet()
+                    except Exception as e:
+                        print(f"BiRefNet: Error during lazy loading: {e}")
+                        # Reset state and try once more
+                        self.reset_birefnet_state()
+                        print("BiRefNet: Retrying after state reset...")
+                        self._lazy_load_birefnet()
+
+                # Get mask using BiRefNet
+                mask = self._get_birefnet_mask(input, device)
+
             # Convert input to RGBA and apply mask
             input_rgba = input.convert('RGBA')
             input_array = np.array(input_rgba)
@@ -227,35 +281,32 @@ class Hi3DGenPipeline(Pipeline):
         return output
 
     def _lazy_load_birefnet(self):
-        """Lazy loading of the BiRefNet model from local cache only"""
-        from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation, AutoModelForImageSegmentation
-        
+        """Lazy loading of the BiRefNet model from local cache only.
+
+        The model code ships with the app (hi3dgen/third_party/birefnet) and only model.safetensors is read, so no
+        remote code, no transformers/timm/kornia and no network are involved. The model is created on the CPU and
+        moved to the GPU only while a mask is computed (see _get_birefnet_mask).
+        """
+        from ..third_party.birefnet import load_birefnet
+
         import os
-        
+
         # Check for local cached model in weights directory
         current_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(os.path.dirname(current_dir))  # Go up two levels to project root
         weights_dir = os.path.join(project_root, 'weights')
         local_birefnet_path = os.path.join(weights_dir, "models--ZhengPeng7--BiRefNet")
-        
+
         if os.path.exists(local_birefnet_path):
             print(f"BiRefNet: Using local cached model at {local_birefnet_path}")
-            self.birefnet_model = AutoModelForImageSegmentation.from_pretrained(
-                local_birefnet_path,
-                trust_remote_code=True,
-                local_files_only=True  # Prevent downloading
-            ).to(self.device)
+            self.birefnet_model = load_birefnet(local_birefnet_path)
         else:
             # Check HuggingFace cache as fallback
             hf_cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
             hf_birefnet_path = os.path.join(hf_cache_dir, "models--ZhengPeng7--BiRefNet")
             if os.path.exists(hf_birefnet_path):
                 print(f"BiRefNet: Using HuggingFace cached model at {hf_birefnet_path}")
-                self.birefnet_model = AutoModelForImageSegmentation.from_pretrained(
-                    hf_birefnet_path,
-                    trust_remote_code=True,
-                    local_files_only=True  # Prevent downloading
-                ).to(self.device)
+                self.birefnet_model = load_birefnet(hf_birefnet_path)
             else:
                 raise FileNotFoundError(
                     f"BiRefNet model not found in local cache.\n"
@@ -264,7 +315,7 @@ class Hi3DGenPipeline(Pipeline):
                     f"  2. {hf_birefnet_path}\n"
                     f"Please run DownloadModels.py to download required models."
                 )
-        
+
         self.birefnet_model.eval()
     
     def reset_birefnet_state(self):
@@ -284,20 +335,55 @@ class Hi3DGenPipeline(Pipeline):
         else:
             print("Hi3DGen Pipeline: No BiRefNet model to reset")
 
-    def _get_birefnet_mask(self, image: Image.Image) -> np.ndarray:
-        """Get object mask using BiRefNet"""
+    def _run_birefnet(self, input_images: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Run BiRefNet on `device` (the model is moved there first) and return the sigmoid map on the CPU."""
+        from ..third_party.birefnet import ieee_fp32_convs
+
+        model = self.birefnet_model
+        if next(model.parameters()).device != device:
+            model.to(device)
+        with torch.no_grad(), ieee_fp32_convs():
+            return model(input_images.to(device))[-1].sigmoid().cpu()
+
+    def park_birefnet(self):
+        """Move the BiRefNet model to the CPU (frees its GPU memory)."""
+        with _BIREFNET_LOCK:
+            model = getattr(self, 'birefnet_model', None)
+            if model is not None:
+                model.to("cpu")
+
+    def _get_birefnet_mask(self, image: Image.Image, device=None) -> np.ndarray:
+        """Get object mask using BiRefNet.
+
+        Runs in fp32 on the GPU when there is one (the model is parked on the CPU again afterwards unless
+        `birefnet_keep_on_gpu` is set), with a CPU fallback when the GPU is out of memory. Convolutions run without
+        TF32, so the mask matches the CPU result as closely as possible. `device="cpu"` forces the CPU.
+        """
         image_size = (1024, 1024)
         transform_image = transforms.Compose([
             transforms.Resize(image_size),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
-        
-        input_images = transform_image(image).unsqueeze(0).to(self.device)
-        
-        with torch.no_grad():
-            preds = self.birefnet_model(input_images)[-1].sigmoid().cpu()
-        
+
+        input_images = transform_image(image).unsqueeze(0)
+
+        use_gpu = torch.cuda.is_available() and (device is None or torch.device(device).type == "cuda")
+        device = torch.device("cuda") if use_gpu else torch.device("cpu")
+        with _BIREFNET_LOCK:
+            try:
+                try:
+                    preds = self._run_birefnet(input_images, device)
+                except torch.cuda.OutOfMemoryError:
+                    print("BiRefNet: not enough GPU memory, running on the CPU instead")
+                    self.birefnet_model.to("cpu")
+                    torch.cuda.empty_cache()
+                    preds = self._run_birefnet(input_images, torch.device("cpu"))
+            finally:
+                if use_gpu and not getattr(self, "birefnet_keep_on_gpu", False):
+                    self.birefnet_model.to("cpu")
+                    torch.cuda.empty_cache()
+
         pred = preds[0].squeeze()
         pred_pil = transforms.ToPILImage()(pred)
         mask = pred_pil.resize(image.size)
@@ -368,13 +454,14 @@ class Hi3DGenPipeline(Pipeline):
         reso = flow_model.resolution
         noise = torch.randn(num_samples, flow_model.in_channels, reso, reso, reso).to(self.device)
         sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
-        z_s = self.sparse_structure_sampler.sample(
-            flow_model,
-            noise,
-            **cond,
-            **sampler_params,
-            verbose=True
-        )["samples"]
+        with samplers.sampling_stage("Sparse structure"):
+            z_s = self.sparse_structure_sampler.sample(
+                flow_model,
+                noise,
+                **cond,
+                **sampler_params,
+                verbose=True
+            )["samples"]
         
         # Decode occupancy latent
         decoder = self.models['sparse_structure_decoder']
@@ -423,13 +510,14 @@ class Hi3DGenPipeline(Pipeline):
             coords=coords,
         )
         sampler_params = {**self.slat_sampler_params, **sampler_params}
-        slat = self.slat_sampler.sample(
-            flow_model,
-            noise,
-            **cond,
-            **sampler_params,
-            verbose=True
-        )["samples"]
+        with samplers.sampling_stage("Structured latent"):
+            slat = self.slat_sampler.sample(
+                flow_model,
+                noise,
+                **cond,
+                **sampler_params,
+                verbose=True
+            )["samples"]
 
         std = torch.tensor(self.slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.slat_normalization['mean'])[None].to(slat.device)
@@ -518,10 +606,12 @@ class Hi3DGenPipeline(Pipeline):
             
         sampler._inference_model = _new_inference_model.__get__(sampler, type(sampler))
 
-        yield
-
-        sampler._inference_model = sampler._old_inference_model
-        delattr(sampler, f'_old_inference_model')
+        try:
+            yield
+        finally:
+            # restore even when sampling raised (out of memory, cancel), otherwise the sampler stays patched
+            sampler._inference_model = sampler._old_inference_model
+            delattr(sampler, f'_old_inference_model')
 
     @torch.no_grad()
     def run_multi_image(
