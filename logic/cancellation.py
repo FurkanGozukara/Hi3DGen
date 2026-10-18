@@ -68,7 +68,9 @@ class GlobalCancellationManager:
             stage: Current stage description
         """
         with self._lock:
-            if self._status.processing_state != ProcessingState.IDLE:
+            # CANCELLED is only set by finish_operation(), i.e. the cancelled operation has already ended, so a new one
+            # may start right away instead of failing during the short state reset delay.
+            if self._status.processing_state not in (ProcessingState.IDLE, ProcessingState.CANCELLED):
                 raise RuntimeError(f"Cannot start {operation_type.value} - already in {self._status.processing_state.value} state")
             
             self._status = CancellationStatus(
