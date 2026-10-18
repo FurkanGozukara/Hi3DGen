@@ -2,6 +2,11 @@ import logging
 import os
 import sys
 import platform
+
+# Every model is read from the weights folder: never wait for (or call) the Hugging Face Hub, set to 0 to allow it
+os.environ.setdefault('HF_HUB_OFFLINE', '1')
+os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
+
 import torch
 from contextlib import asynccontextmanager
 from pathlib import Path # Use Path for easier path manipulation
@@ -63,7 +68,7 @@ parser.add_argument("--port", type=int, default=7960, help="Port to bind the ser
 # but we will resolve it against WEIGHTS_DIR if it looks like an HF ID.
 parser.add_argument("--model_path", type=str, default="Stable-X/trellis-normal-v0-1", help="Hi3DGen pipeline model path (HF ID or local path)")
 # Use local paths for offline operation
-parser.add_argument("--normal_predictor_repo", type=str, default=None, help="torch.hub repo for normal predictor (defaults to local weights directory)")
+parser.add_argument("--normal_predictor_repo", type=str, default=None, help="torch.hub repo for normal predictor (defaults to the StableNormal copy in third_party)")
 parser.add_argument("--normal_predictor_model", type=str, default="StableNormal_turbo", help="Model name for normal predictor.")
 parser.add_argument("--normal_predictor_yoso", type=str, default="yoso-normal-v1-8-1", help="YOSO version for normal predictor.")
 # --weights_cache_dir is now effectively determined by WEIGHTS_DIR above.
@@ -80,7 +85,7 @@ logger.info(f"Using weights directory: {final_weights_dir.resolve()}")
 
 # Auto-resolve normal_predictor_repo to local path if not specified
 if args.normal_predictor_repo is None:
-    args.normal_predictor_repo = str(final_weights_dir / "github--hugoycj--StableNormal")
+    args.normal_predictor_repo = str(PROJECT_ROOT_DIR / "third_party" / "StableNormal")
     logger.info(f"Using local StableNormal at: {args.normal_predictor_repo}")
 
 
@@ -88,7 +93,7 @@ if args.normal_predictor_repo is None:
 print("\n" + "="*50)
 print("Stable3DGen (Hi3DGen) - StableProjectorz API Server is starting up:")
 print(f"Models will be cached/loaded from: {final_weights_dir.resolve()}")
-print("If it's the first time, neural nets will download. Next runs will be faster.")
+print("All models are loaded from the weights folder; nothing is downloaded here (the installer downloads them).")
 print("Touching this window will pause it. If it happens, click inside it and press 'Enter' to unpause")
 print("="*50 + "\n")
 
@@ -118,22 +123,22 @@ def verify_weights_api(weights_dir_path: Path) -> dict:
             logger.error(f"  ❌ MISSING: {repo_id} (expected at {local_repo_root})")
             all_present = False
     
-    # Check GitHub repos
-    github_repos = [
-        ("hugoycj", "StableNormal"),
-        ("facebookresearch", "dinov2"),
+    # StableNormal is vendored in third_party; DINOv2 (code and weights) comes from the installer
+    required_items = [
+        ("StableNormal (third_party)", PROJECT_ROOT_DIR / "third_party" / "StableNormal" / "hubconf.py"),
+        ("facebookresearch/dinov2", weights_dir_path / "github--facebookresearch--dinov2" / "hubconf.py"),
+        ("DINOv2 weights", weights_dir_path / "dinov2_vitl14_reg4_pretrain.pth"),
     ]
     
-    for github_user, repo_name in github_repos:
-        local_repo_root = weights_dir_path / f"github--{github_user}--{repo_name}"
-        if local_repo_root.exists():
-            logger.info(f"  ✅ Found: {github_user}/{repo_name} at {local_repo_root}")
+    for label, item_path in required_items:
+        if item_path.exists():
+            logger.info(f"  ✅ Found: {label} at {item_path}")
         else:
-            logger.error(f"  ❌ MISSING: {github_user}/{repo_name} (expected at {local_repo_root})")
+            logger.error(f"  ❌ MISSING: {label} (expected at {item_path})")
             all_present = False
     
     if not all_present:
-        logger.warning("⚠️  Some models are missing. Please run DownloadModels.py to download them.")
+        logger.warning("⚠️  Some models are missing. Please run the model download of the installer (DownloadModels.py).")
         logger.warning("   The API will attempt to proceed but may fail if models are missing.")
     else:
         logger.info("✅ All models verified and present locally!")

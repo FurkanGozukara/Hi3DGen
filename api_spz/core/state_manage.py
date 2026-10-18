@@ -8,6 +8,17 @@ from hi3dgen.pipelines import Hi3DGenPipeline # Assuming this is the correct imp
 logger = logging.getLogger("stable3dgen_api")
 
 
+def _to_cpu(model):
+    """Move a torch module or a diffusers pipeline to the CPU (diffusers pipelines have `.to()` but no `.cpu()`)."""
+    if hasattr(model, "cpu"):
+        model.cpu()
+    elif hasattr(model, "to"):
+        try:
+            model.to("cpu", silence_dtype_warnings=True)  # fp16 weights parked on the CPU are fine, diffusers would warn
+        except TypeError:
+            model.to("cpu")
+
+
 class Hi3DGenState:
     
     def __init__(self):
@@ -29,10 +40,10 @@ class Hi3DGenState:
 
         if self.normal_predictor:
             # The normal_predictor wrapper from torch.hub might have an internal 'model'
-            if hasattr(self.normal_predictor, 'model') and hasattr(self.normal_predictor.model, 'cpu'):
-                self.normal_predictor.model.cpu()
-            elif hasattr(self.normal_predictor, 'cpu'): # If the wrapper itself is an nn.Module
-                self.normal_predictor.cpu()
+            if hasattr(self.normal_predictor, 'model'):
+                _to_cpu(self.normal_predictor.model)
+            else:
+                _to_cpu(self.normal_predictor)
         del self.normal_predictor
         self.normal_predictor = None
         
@@ -78,13 +89,12 @@ class Hi3DGenState:
                 raise FileNotFoundError(
                     f"Normal Predictor repository not found at: {normal_predictor_repo}\n"
                     f"Expected a local directory with hubconf.py.\n"
-                    f"Please ensure models are downloaded using DownloadModels.py\n"
-                    f"Expected path: {Path(weights_cache_dir) / 'github--hugoycj--StableNormal'}"
+                    f"StableNormal is part of this app (third_party/StableNormal); the folder is missing or incomplete."
                 )
             
             logger.info(f"Loading Normal Predictor '{normal_predictor_model}' from local repo '{normal_predictor_repo}' to CPU. Cache dir: {weights_cache_dir}")
             
-            # torch.hub.load loads the model wrapper. The wrapper's __init__ might try to move its internal model to CUDA.
+            # torch.hub.load loads the model wrapper straight onto the CPU (device='cpu'); it is moved to the GPU while in use.
             # We want to control this. For now, we load it and then immediately ensure its internal model is on CPU if possible.
             self.normal_predictor = torch.hub.load(
                 repo_or_dir=normal_predictor_repo,
@@ -93,16 +103,17 @@ class Hi3DGenState:
                 trust_repo=True, 
                 yoso_version=yoso_version,
                 local_cache_dir=weights_cache_dir,
+                device='cpu',
             )
             if self.normal_predictor is None: 
                 raise RuntimeError(f"torch.hub.load for '{normal_predictor_model}' from '{normal_predictor_repo}' returned None.")
 
             # Ensure the loaded normal_predictor (and its internal model) are on CPU
-            if hasattr(self.normal_predictor, 'model') and hasattr(self.normal_predictor.model, 'cpu'):
-                self.normal_predictor.model.cpu() # Target the internal YOSONormalsPipeline
+            if hasattr(self.normal_predictor, 'model'):
+                _to_cpu(self.normal_predictor.model) # Target the internal YOSONormalsPipeline
                 self._set_eval_mode(self.normal_predictor.model, "NormalPredictor.model")
-            elif hasattr(self.normal_predictor, 'cpu'): # If the wrapper itself is an nn.Module
-                self.normal_predictor.cpu()
+            else:
+                _to_cpu(self.normal_predictor)
                 self._set_eval_mode(self.normal_predictor, "NormalPredictor (wrapper)")
 
             logger.info("Normal Predictor loaded to CPU and configured.")

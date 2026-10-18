@@ -38,7 +38,6 @@ import torch
 import numpy as np
 from hi3dgen.pipelines import Hi3DGenPipeline
 import tempfile
-import hf_transfer
 import trimesh
 import open3d as o3d
 import xatlas
@@ -83,7 +82,6 @@ def verify_weights(weights_dir: str) -> dict:
     
     # Check GitHub repos
     github_repos = [
-        ("hugoycj", "StableNormal"),
         ("facebookresearch", "dinov2"),
     ]
     
@@ -376,11 +374,11 @@ def generate_3d(image, seed=-1,
     current_normal_predictor_instance = None 
     try:
         print("Normal Prediction: Loading model from local cache...") 
-        # Use local StableNormal model from weights directory
-        stablenormal_local_path = os.path.join(WEIGHTS_DIR, "github--hugoycj--StableNormal")
+        # StableNormal ships with the app (third_party/StableNormal); the weights come from the weights directory
+        stablenormal_local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party", "StableNormal")
         current_normal_predictor_instance = torch.hub.load(
-            stablenormal_local_path, "StableNormal_turbo", source='local', trust_repo=True, 
-            yoso_version='yoso-normal-v1-8-1', local_cache_dir=WEIGHTS_DIR
+            stablenormal_local_path, "StableNormal_turbo", source='local', trust_repo=True,
+            yoso_version='yoso-normal-v1-8-1', local_cache_dir=WEIGHTS_DIR, device='cuda:0' if torch.cuda.is_available() else 'cpu'
         )
         print("Normal Prediction: Generating normal map...")
         normal_image_pil = current_normal_predictor_instance(image, resolution=768, match_input_resolution=True, data_type='object')
@@ -390,8 +388,8 @@ def generate_3d(image, seed=-1,
     finally:
         if current_normal_predictor_instance is not None: 
             print("Normal Prediction: Unloading model...")
-            if hasattr(current_normal_predictor_instance, 'model') and hasattr(current_normal_predictor_instance.model, 'cpu'):
-                current_normal_predictor_instance.model.cpu() 
+            if hasattr(current_normal_predictor_instance, 'model') and hasattr(current_normal_predictor_instance.model, 'to'):
+                current_normal_predictor_instance.model.to('cpu', silence_dtype_warnings=True)
             del current_normal_predictor_instance 
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
