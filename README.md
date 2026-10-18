@@ -26,7 +26,7 @@
 
 Hi3DGen is the newest state of the art image to 3D mesh generation model. In this tutorial I will show you step by step how to install and use this amazing open source AI model to generate the very best 3D meshes from static images and use in your projects.
 
-## What is new in V18
+## What is new in V19
 
 **Stack:** Python 3.12, CUDA 13, torch 2.13, Gradio 6.30, transformers 5, diffusers 0.41, numpy 2.5. One `requirements.txt` does the whole installation. StableNormal and BiRefNet ship with the app (`third_party/StableNormal`, `hi3dgen/third_party/birefnet`): they no longer depend on remote code, other repositories or the network, and all models are downloaded once by the installer.
 

@@ -63,7 +63,7 @@ except ImportError as e:
     print(f'System status module not available: {e}')
     SYSTEM_STATUS_AVAILABLE = False
 
-APP_VERSION = 'V18'
+APP_VERSION = 'V19'
 PATREON_URL = 'https://www.patreon.com/posts/130766890'
 MAX_SEED = int(np.iinfo(np.int32).max)
 TMP_DIR = str(ROOT / 'tmp')
