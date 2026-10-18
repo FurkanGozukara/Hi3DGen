@@ -1,2311 +1,1188 @@
-import gradio as gr 
-import os 
-os .environ ['SPCONV_ALGO']='native'
-from typing import *
-import traceback 
-import datetime 
-import shutil 
-import torch 
-import numpy as np 
-from hi3dgen .pipelines import Hi3DGenPipeline 
-import tempfile 
-import hf_transfer 
-import trimesh 
-import open3d as o3d 
-import xatlas 
-import argparse 
-import threading 
-from logic .auto_save import auto_save_generation ,open_outputs_folder 
-from logic .parameter_info import format_parameter_info_html 
-from logic .processing_core import ProcessingCore ,ProcessingParameters 
-from logic .batch_processing import create_batch_processor ,BatchSettings 
-from logic .cancellation import (
-get_cancellation_manager ,request_cancellation ,get_status_summary ,
-start_single_processing ,finish_processing ,should_cancel ,
-add_cleanup_callback ,remove_cleanup_callback 
-)
-from logic .preset_manager import (
-save_preset_from_ui ,load_preset_for_ui ,delete_preset_from_ui ,
-initialize_presets_for_ui ,get_preset_choices_for_ui ,
-validate_preset_name ,get_preset_status_for_ui 
-)
-from logic .preset_file_manager import initialize_preset_file_system
-from logic .preset_validation import validate_preset_for_ui ,validate_ui_parameters
-
-try :
-    from logic .system_status import get_status_summary as get_comprehensive_status_summary ,print_system_status 
-    SYSTEM_STATUS_AVAILABLE =True 
-except ImportError as e :
-    print (f"⚠️ System status module not available: {e}")
-    SYSTEM_STATUS_AVAILABLE =False 
-
-    def get_comprehensive_status_summary (*args ,**kwargs ):
-        return "🔍 System Status: Basic monitoring only (system_status module unavailable)"
-    def print_system_status (*args ,**kwargs ):
-        print ("⚠️ Advanced system status unavailable")
-
-MAX_SEED =np .iinfo (np .int32 ).max 
-TMP_DIR =os .path .join (os .path .dirname (os .path .abspath (__file__ )),'tmp')
-WEIGHTS_DIR =os .path .join (os .path .dirname (os .path .abspath (__file__ )),'weights')
-os .makedirs (TMP_DIR ,exist_ok =True )
-os .makedirs (WEIGHTS_DIR ,exist_ok =True )
-
-hi3dgen_pipeline =None 
-normal_predictor =None 
-global_cached_paths =None 
-
-processing_core =None 
-batch_processor =None 
-cancellation_manager =None 
-
-def verify_weights (weights_dir :str )->dict :
-    """
-    Verify that all required models are present in the weights directory.
-    Does NOT download anything - all models must be pre-downloaded.
-    """
-    import os 
-    import sys 
-    from pathlib import Path 
-
-    model_ids =[
-    "Stable-X/trellis-normal-v0-1","Stable-X/yoso-normal-v1-8-1","ZhengPeng7/BiRefNet"
-    ]
-    cached_paths ={}
-
-    print ("Verifying locally cached models...")
-    all_present =True 
-
-    for repo_id in model_ids :
-        local_repo_root =Path (weights_dir )/f"models--{repo_id.replace('/', '--')}"
-        
-        if local_repo_root .exists ():
-            print (f"  ✅ Found: {repo_id} at {local_repo_root}")
-            cached_paths [repo_id ]=str (local_repo_root )
-        else :
-            print (f"  ❌ MISSING: {repo_id} (expected at {local_repo_root})")
-            all_present =False 
-    
-    # Check GitHub repos
-    github_repos =[
-        ("hugoycj", "StableNormal"),
-        ("facebookresearch", "dinov2"),
-    ]
-    
-    for github_user ,repo_name in github_repos :
-        local_repo_root =Path (weights_dir )/f"github--{github_user}--{repo_name}"
-        if local_repo_root .exists ():
-            print (f"  ✅ Found: {github_user}/{repo_name} at {local_repo_root}")
-        else :
-            print (f"  ❌ MISSING: {github_user}/{repo_name} (expected at {local_repo_root})")
-            all_present =False 
-    
-    if not all_present :
-        print ("\n⚠️  Some models are missing. Please run DownloadModels.py to download them.")
-        print ("   The app will attempt to proceed but may fail if models are missing.")
-    else :
-        print ("\n✅ All models verified and present locally!")
-    
-    sys .stdout .flush ()
-    return cached_paths 
-
-def preprocess_mesh (mesh_prompt ):
-    print ("Processing mesh")
-    trimesh_mesh =trimesh .load_mesh (mesh_prompt )
-    trimesh_mesh .export (mesh_prompt +'.glb')
-    return mesh_prompt +'.glb'
-
-def preprocess_image (image ):
-    global hi3dgen_pipeline 
-    if image is None :return None 
-
-    if hi3dgen_pipeline is None :
-        raise RuntimeError ("FATAL: Hi3DGenPipeline not loaded. Cannot preprocess.")
-
-    try :
-        return hi3dgen_pipeline .preprocess_image (image ,resolution =1024 )
-    except Exception as e :
-
-        if "BiRefNet"in str (e )or "401"in str (e )or "RepositoryNotFoundError"in str (e ):
-            print (f"BiRefNet error detected during preprocess: {e}")
-            print ("Attempting to reset BiRefNet state and retry...")
-            try :
-                if hasattr (hi3dgen_pipeline ,'reset_birefnet_state'):
-                    hi3dgen_pipeline .reset_birefnet_state ()
-
-                return hi3dgen_pipeline .preprocess_image (image ,resolution =1024 )
-            except Exception as retry_e :
-                print (f"Retry after BiRefNet reset also failed: {retry_e}")
-                raise retry_e 
-        else :
-
-            raise e 
-
-def simplify_mesh_open3d (in_mesh :trimesh .Trimesh ,
-poly_count_pcnt :float =0.5 )->trimesh .Trimesh :
-
-    if not isinstance (in_mesh ,trimesh .Trimesh ):
-        print ("Simplify ERR: Invalid input type.")
-        return in_mesh 
-
-    if not (0.0 <poly_count_pcnt <1.0 ):
-        print (f"Simplify skip: poly_count_pcnt {poly_count_pcnt:.2f} out of (0,1) range.")
-        return in_mesh 
-
-    current_tris =len (in_mesh .faces )
-    if current_tris ==0 :return in_mesh 
-
-    target_tris =int (current_tris *poly_count_pcnt )
-    target_tris =max (1 ,target_tris )
-
-    if target_tris >=current_tris :
-        print (f"Simplify skip: Target {target_tris} >= current {current_tris}.")
-        return in_mesh 
-
-    print (f"Simplifying: {current_tris} faces -> ~{target_tris} faces ({ (1.0-poly_count_pcnt)*100:.0f}% original).")
-
-    o3d_m =o3d .geometry .TriangleMesh ()
-    o3d_m .vertices =o3d .utility .Vector3dVector (in_mesh .vertices )
-    o3d_m .triangles =o3d .utility .Vector3iVector (in_mesh .faces )
-
-    try :
-
-        simplified_o3d_m =o3d_m .simplify_quadric_decimation (target_number_of_triangles =target_tris )
-
-        s_verts =np .asarray (simplified_o3d_m .vertices )
-        s_faces =np .asarray (simplified_o3d_m .triangles )
-
-        if s_faces .size ==0 and current_tris >0 :
-            print ("Simplify WARN: Empty mesh result. Reverting.")
-            return in_mesh 
-
-        return trimesh .Trimesh (vertices =s_verts ,faces =s_faces ,process =True )
-    except Exception as e :
-        print (f"Simplify ERR: Open3D failed ({e}). Reverting.")
-        traceback .print_exc ()
-        return in_mesh 
-
-def unwrap_mesh_with_xatlas (input_mesh :trimesh .Trimesh ,
-max_cost_param :float =8.0 ,
-normal_seam_weight_param :float =1.0 ,
-resolution_param :int =1024 ,
-padding_param :int =2 )->trimesh .Trimesh :
-
-    import time 
-    import sys 
-
-    print ("UV Unwrapping with xatlas: Starting process...")
-    start_time =time .time ()
-
-    input_vertices_orig =input_mesh .vertices .astype (np .float32 )
-    input_faces_orig =input_mesh .faces .astype (np .uint32 )
-    vertex_normals_from_trimesh =input_mesh .vertex_normals 
-    input_normals_orig =np .ascontiguousarray (vertex_normals_from_trimesh ,dtype =np .float32 )
-
-    print (f"  Input mesh: {input_vertices_orig.shape[0]} vertices, {input_faces_orig.shape[0]} faces.")
-
-    face_count =input_faces_orig .shape [0 ]
-
-    min_time_estimate =face_count /50000 
-    max_time_estimate =face_count /15000 
-    avg_time_estimate =face_count /25000 
-
-    print (f"  Expected processing time: {min_time_estimate:.1f}-{max_time_estimate:.1f}s (avg: {avg_time_estimate:.1f}s)")
-    print (f"  Complexity level: {'Low' if face_count < 100000 else 'Medium' if face_count < 500000 else 'High'} ({face_count:,} faces)")
-    sys .stdout .flush ()
-
-    print ("  Phase 1/4: Setting up xatlas Atlas...")
-    phase_start =time .time ()
-    atlas =xatlas .Atlas ()
-    atlas .add_mesh (input_vertices_orig ,input_faces_orig ,input_normals_orig )
-    print (f"  Phase 1/4: Complete ({time.time() - phase_start:.2f}s)")
-    sys .stdout .flush ()
-
-    print ("  Phase 2/4: Configuring xatlas options...")
-    phase_start =time .time ()
-    chart_options =xatlas .ChartOptions ()
-    chart_options .max_cost =max_cost_param 
-    chart_options .normal_seam_weight =normal_seam_weight_param 
-
-    pack_options =xatlas .PackOptions ()
-    pack_options .resolution =resolution_param 
-    pack_options .padding =padding_param 
-    print (f"  Phase 2/4: Complete ({time.time() - phase_start:.2f}s)")
-    print (f"    -> ChartOptions: max_cost={chart_options.max_cost:.2f}, normal_seam_weight={chart_options.normal_seam_weight:.2f}")
-    print (f"    -> PackOptions: resolution={pack_options.resolution}, padding={pack_options.padding}")
-    sys .stdout .flush ()
-
-    print ("  Phase 3/4: Running xatlas.generate() - This is the time-consuming step...")
-    print ("    -> Processing mesh charts and UV packing...")
-    print (f"    -> This may take some time so patiently wait for {face_count:,} faces")
-    print ("    -> xatlas will now run without progress updates (this is normal)")
-    print ("    -> Please wait... processing is happening in the background")
-    sys .stdout .flush ()
-
-    generation_start =time .time ()
-
-    try :
-        print ("    -> Starting xatlas.generate()...")
-        sys .stdout .flush ()
-        atlas .generate (chart_options =chart_options ,pack_options =pack_options )
-        generation_time =time .time ()-generation_start 
-        actual_performance =face_count /generation_time if generation_time >0 else 0 
-        print (f"    -> ✓ xatlas.generate() completed successfully in {generation_time:.2f}s")
-        print (f"    -> Actual performance: {actual_performance:.0f} faces/second")
-    except Exception as e :
-        generation_time =time .time ()-generation_start 
-        print (f"    -> ✗ xatlas.generate() failed after {generation_time:.2f}s: {e}")
-        raise 
-
-    print (f"  Phase 3/4: Complete ({generation_time:.2f}s)")
-    print (f"    -> xatlas generated atlas with dimensions: width={atlas.width}, height={atlas.height}")
-    sys .stdout .flush ()
-
-    print ("  Phase 4/4: Processing xatlas results...")
-    phase_start =time .time ()
-
-    v_out_xref_data ,f_out_indices ,uv_coords_from_xatlas =atlas .get_mesh (0 )
-    print (f"    -> Retrieved mesh data: {uv_coords_from_xatlas.shape[0]} UV vertices, {f_out_indices.shape[0]} faces")
-
-    num_new_vertices =uv_coords_from_xatlas .shape [0 ]
-    if v_out_xref_data .shape ==(num_new_vertices ,):
-        xref_indices =v_out_xref_data .astype (np .uint32 )
-        if np .any (xref_indices >=input_vertices_orig .shape [0 ])or np .any (xref_indices <0 ):
-             raise ValueError ("Invalid xref values from xatlas - out of bounds for original input vertices.")
-        final_vertices_spatial =input_vertices_orig [xref_indices ]
-    elif v_out_xref_data .shape ==(num_new_vertices ,3 ):
-        print ("    -> Warning: xatlas.get_mesh() returned 3D vertex data directly, which is unexpected for add_mesh workflow.")
-        final_vertices_spatial =v_out_xref_data .astype (np .float32 )
-    else :
-        raise ValueError (f"Unexpected shape for vertex/xref data from xatlas.get_mesh: {v_out_xref_data.shape}.")
-
-    print (f"    -> Processed vertex mapping: {final_vertices_spatial.shape[0]} final vertices")
-
-    final_uvs =uv_coords_from_xatlas .astype (np .float32 )
-    if np .any (final_uvs >1.5 ):
-        print ("    -> UVs appear to be in pixel coordinates. Normalizing...")
-        if atlas .width >0 and atlas .height >0 :
-            final_uvs /=np .array ([atlas .width ,atlas .height ],dtype =np .float32 )
-        else :
-            print ("    -> WARNING: Atlas width/height is 0, cannot normalize pixel UVs. Using unnormalized.")
-    else :
-        min_uv =final_uvs .min (axis =0 )if final_uvs .size >0 else "N/A"
-        max_uv =final_uvs .max (axis =0 )if final_uvs .size >0 else "N/A"
-        print (f"    -> UVs appear to be normalized. Min: {min_uv}, Max: {max_uv}")
-
-    print (f"    -> Creating final Trimesh object...")
-    output_mesh =trimesh .Trimesh (vertices =final_vertices_spatial ,faces =f_out_indices ,process =False )
-
-    if final_uvs .shape !=(final_vertices_spatial .shape [0 ],2 ):
-        raise ValueError (f"Shape mismatch for final UVs before Trimesh assignment.")
-
-    material =trimesh .visual .material .PBRMaterial (name ='defaultXatlasMat')
-    output_mesh .visual =trimesh .visual .TextureVisuals (uv =final_uvs ,material =material )
-
-    if hasattr (output_mesh .visual ,'uv')and output_mesh .visual .uv is not None :
-        print (f"    -> Trimesh object successfully created with UVs, Shape: {output_mesh.visual.uv.shape}")
-    else :
-        print ("    -> ERROR: Trimesh object does NOT have UVs assigned after TextureVisuals call.")
-        raise RuntimeError ("Failed to assign UVs to the Trimesh object.")
-
-    print (f"  Phase 4/4: Complete ({time.time() - phase_start:.2f}s)")
-
-    total_time =time .time ()-start_time 
-    print (f"UV Unwrapping with xatlas: Process complete! Total time: {total_time:.2f}s")
-    print (f"  -> Performance: {input_faces_orig.shape[0] / total_time:.0f} faces/second")
-    print (f"  -> Efficiency: {(avg_time_estimate / total_time * 100):.1f}% of estimated average time")
-    sys .stdout .flush ()
-
-    return output_mesh 
-
-def generate_3d (image ,seed =-1 ,
-ss_guidance_strength =3 ,ss_sampling_steps =50 ,
-slat_guidance_strength =3 ,slat_sampling_steps =6 ,
-poly_count_pcnt :float =0.5 ,
-xatlas_max_cost :float =8.0 ,
-xatlas_normal_seam_weight :float =1.0 ,
-xatlas_resolution :int =1024 ,
-xatlas_padding :int =2 ,
-normal_map_resolution :int =768 ,
-normal_match_input_resolution :bool =True ,
-auto_save_obj :bool =True ,
-auto_save_glb :bool =True ,
-auto_save_ply :bool =True ,
-auto_save_stl :bool =True ):
-
-    if image is None :
-        print ("Input image is None. Aborting generation.")
-        return None ,None ,None 
-    if seed ==-1 :seed =np .random .randint (0 ,MAX_SEED )
-
-    if hi3dgen_pipeline is None :
-        print ("FATAL: Hi3DGenPipeline not loaded. Cannot generate 3D.")
-        return None ,None ,None 
-
-    normal_image_pil =None 
-    gradio_model_path =None 
-
-    current_normal_predictor_instance =None 
-    try :
-        print ("Normal Prediction: Loading model from local cache...")
-
-        yoso_model_dir_name ="models--Stable-X--yoso-normal-v1-8-1"
-        yoso_local_path =os .path .join (WEIGHTS_DIR ,yoso_model_dir_name )
-
-        if not os .path .exists (yoso_local_path ):
-            print (f"ERROR: YOSO model not found at {yoso_local_path}")
-            raise FileNotFoundError (f"YOSO model not found at {yoso_local_path}. Please ensure models are downloaded.")
-
-        birefnet_local_path =os .path .join (WEIGHTS_DIR ,"models--ZhengPeng7--BiRefNet")
-        if not os .path .exists (birefnet_local_path ):
-            print (f"ERROR: BiRefNet model not found at {birefnet_local_path}")
-
-            raise FileNotFoundError (f"BiRefNet model not found at {birefnet_local_path}. Please ensure models are downloaded.")
-
-        from pathlib import Path 
-        import shutil 
-
-        hf_cache_dir =os .path .expanduser ("~/.cache/huggingface/hub")
-        os .makedirs (hf_cache_dir ,exist_ok =True )
-
-        model_mappings ={
-        "models--Stable-X--yoso-normal-v1-8-1":"models--Stable-X--yoso-normal-v1-8-1",
-        "models--ZhengPeng7--BiRefNet":"models--ZhengPeng7--BiRefNet"
-        }
-
-        for src_name ,dst_folder_name in model_mappings .items ():
-            src_path_in_weights =os .path .join (WEIGHTS_DIR ,src_name )
-            dst_path_in_hf_cache =os .path .join (hf_cache_dir ,dst_folder_name )
-
-            if os .path .exists (src_path_in_weights )and not os .path .exists (dst_path_in_hf_cache ):
-                print (f"Copying {src_name} from {WEIGHTS_DIR} to HuggingFace cache at {dst_path_in_hf_cache}...")
-                shutil .copytree (src_path_in_weights ,dst_path_in_hf_cache )
-
-        yoso_model_abs_path =os .path .abspath (yoso_local_path )
-        print (f"Normal Prediction: Attempting to load YOSO model using absolute local path: {yoso_model_abs_path}")
-
-        current_normal_predictor_instance =torch .hub .load (
-        "hugoycj/StableNormal","StableNormal_turbo",trust_repo =True ,
-        yoso_version =yoso_model_abs_path 
-        )
-
-        print ("Normal Prediction: Generating normal map...")
-        normal_image_pil =current_normal_predictor_instance (image ,resolution =normal_map_resolution ,match_input_resolution =normal_match_input_resolution ,data_type ='object')
-    except Exception as e :
-        print (f"ERROR in Normal Prediction stage: {e}")
-        traceback .print_exc ()
-    finally :
-        if current_normal_predictor_instance is not None :
-            print ("Normal Prediction: Unloading model...")
-            try :
-
-                if torch .cuda .is_available ():
-                    torch .cuda .synchronize ()
-
-                if hasattr (current_normal_predictor_instance ,'model')and hasattr (current_normal_predictor_instance .model ,'cpu'):
-                    current_normal_predictor_instance .model .cpu ()
-
-                del current_normal_predictor_instance 
-
-                if torch .cuda .is_available ():
-                    torch .cuda .empty_cache ()
-
-                print ("Normal Prediction: Model unloaded successfully")
-
-            except RuntimeError as cuda_error :
-                if "CUDA"in str (cuda_error ):
-                    print (f"Normal Prediction: CUDA error during cleanup: {cuda_error}")
-                    print ("Normal Prediction: Attempting force cleanup...")
-                    try :
-
-                        if current_normal_predictor_instance is not None :
-                            del current_normal_predictor_instance 
-
-                        if torch .cuda .is_available ():
-                            torch .cuda .empty_cache ()
-                            torch .cuda .synchronize ()
-
-                        print ("Normal Prediction: Force cleanup completed")
-                    except Exception as force_error :
-                        print (f"Normal Prediction: Force cleanup also failed: {force_error}")
-                else :
-                    print (f"Normal Prediction: Non-CUDA error during cleanup: {cuda_error}")
-            except Exception as e :
-                print (f"Normal Prediction: Unexpected error during cleanup: {e}")
-
-                if 'current_normal_predictor_instance'in locals ():
-                    try :
-                        del current_normal_predictor_instance 
-                    except :
-                        pass 
-
-                try :
-                    if torch .cuda .is_available ():
-                        torch .cuda .empty_cache ()
-                except :
-                    pass 
-
-    if normal_image_pil is None :
-        print ("ERROR: Normal map not generated after Stage 1. Aborting 3D generation.")
-        return None ,None ,None 
-
-    pipeline_on_gpu =False 
-    try :
-        import time 
-        import sys 
-        generation_start_time =time .time ()
-
-        if torch .cuda .is_available ():
-            print ("3D Generation: Moving Hi3DGen pipeline to GPU...")
-            hi3dgen_pipeline .cuda ();pipeline_on_gpu =True 
-
-        print ("3D Generation: Running Hi3DGen pipeline...")
-        pipeline_start =time .time ()
-        outputs =hi3dgen_pipeline .run (
-        normal_image_pil ,seed =seed ,formats =["mesh",],preprocess_image =False ,
-        sparse_structure_sampler_params ={"steps":ss_sampling_steps ,"cfg_strength":ss_guidance_strength },
-        slat_sampler_params ={"steps":slat_sampling_steps ,"cfg_strength":slat_guidance_strength },
-        )
-        pipeline_time =time .time ()-pipeline_start 
-        print (f"3D Generation: Hi3DGen pipeline completed in {pipeline_time:.2f}s")
-        sys .stdout .flush ()
-
-        timestamp =datetime .datetime .now ().strftime ('%Y%m%d%H%M%S')
-        output_dir =os .path .join (TMP_DIR ,timestamp )
-        os .makedirs (output_dir ,exist_ok =True )
-
-        mesh_path_glb =os .path .join (output_dir ,"mesh.glb")
-
-        print ("Mesh Processing: Converting to Trimesh and simplifying...")
-        mesh_start =time .time ()
-        raw_mesh_trimesh =outputs ['mesh'][0 ].to_trimesh (transform_pose =True )
-        mesh_for_uv_unwrap =simplify_mesh_open3d (raw_mesh_trimesh ,poly_count_pcnt )
-        mesh_processing_time =time .time ()-mesh_start 
-        print (f"Mesh Processing: Completed in {mesh_processing_time:.2f}s")
-        sys .stdout .flush ()
-
-        unwrapped_mesh_trimesh =unwrap_mesh_with_xatlas (mesh_for_uv_unwrap ,
-        max_cost_param =xatlas_max_cost ,
-        normal_seam_weight_param =xatlas_normal_seam_weight ,
-        resolution_param =xatlas_resolution ,
-        padding_param =xatlas_padding )
-
-        print (f"File Export: Exporting GLB to {mesh_path_glb}...")
-        export_start =time .time ()
-        unwrapped_mesh_trimesh .export (mesh_path_glb )
-        export_time =time .time ()-export_start 
-        print (f"File Export: GLB exported successfully in {export_time:.2f}s")
-
-        total_generation_time =time .time ()-generation_start_time 
-        print (f"=== GENERATION COMPLETE ===")
-        print (f"Total time breakdown:")
-        print (f"  - Hi3DGen pipeline: {pipeline_time:.2f}s ({pipeline_time/total_generation_time*100:.1f}%)")
-        print (f"  - Mesh processing: {mesh_processing_time:.2f}s ({mesh_processing_time/total_generation_time*100:.1f}%)")
-        print (f"  - UV Unwrapping: (see detailed breakdown above)")
-        print (f"  - File export: {export_time:.2f}s ({export_time/total_generation_time*100:.1f}%)")
-        print (f"  - TOTAL: {total_generation_time:.2f}s")
-        sys .stdout .flush ()
-
-        gradio_model_path =mesh_path_glb 
-
-    except Exception as e :
-        print (f"ERROR in 3D Generation or UV Unwrapping stage: {e}")
-        traceback .print_exc ()
-        gradio_model_path =None 
-    finally :
-        if pipeline_on_gpu :
-            print ("3D Generation: Moving Hi3DGen pipeline to CPU...")
-            try :
-
-                if torch .cuda .is_available ():
-                    torch .cuda .synchronize ()
-
-                hi3dgen_pipeline .cpu ()
-
-                if torch .cuda .is_available ():
-                    torch .cuda .empty_cache ()
-
-                print ("3D Generation: Successfully moved Hi3DGen pipeline to CPU")
-
-            except RuntimeError as cuda_error :
-                if "CUDA"in str (cuda_error ):
-                    print (f"3D Generation: CUDA error during pipeline cleanup: {cuda_error}")
-                    print ("3D Generation: Attempting force cleanup...")
-                    try :
-
-                        if torch .cuda .is_available ():
-                            torch .cuda .empty_cache ()
-                            torch .cuda .synchronize ()
-                        print ("3D Generation: Force cleanup completed")
-                    except Exception as force_error :
-                        print (f"3D Generation: Force cleanup also failed: {force_error}")
-                else :
-                    print (f"3D Generation: Non-CUDA error during cleanup: {cuda_error}")
-            except Exception as e :
-                print (f"3D Generation: Unexpected error during pipeline cleanup: {e}")
-
-                try :
-                    if torch .cuda .is_available ():
-                        torch .cuda .empty_cache ()
-                except :
-                    pass 
-
-    if gradio_model_path and (auto_save_obj or auto_save_glb or auto_save_ply or auto_save_stl ):
-        try :
-            enabled_formats ={
-            "obj":auto_save_obj ,
-            "glb":auto_save_glb ,
-            "ply":auto_save_ply ,
-            "stl":auto_save_stl 
-            }
-
-            print ("Starting auto-save process...")
-            auto_save_result =auto_save_generation (
-            mesh_path =gradio_model_path ,
-            normal_image =normal_image_pil ,
-            enabled_formats =enabled_formats 
-            )
-
-            if auto_save_result :
-                print (f"✓ Auto-save successful: Saved to folder {auto_save_result['folder_number']}")
-                print (f"  Saved {len(auto_save_result['saved_files'])} files")
-            else :
-                print ("✗ Auto-save failed")
-
-        except Exception as e :
-            print (f"Auto-save error: {e}")
-            traceback .print_exc ()
-
-    return normal_image_pil ,gradio_model_path ,gradio_model_path 
-
-def generate_3d_with_cancellation (image ,seed =-1 ,
-ss_guidance_strength =3 ,ss_sampling_steps =50 ,
-slat_guidance_strength =3 ,slat_sampling_steps =6 ,
-poly_count_pcnt :float =0.5 ,
-xatlas_max_cost :float =8.0 ,
-xatlas_normal_seam_weight :float =1.0 ,
-xatlas_resolution :int =1024 ,
-xatlas_padding :int =2 ,
-normal_map_resolution :int =768 ,
-normal_match_input_resolution :bool =True ,
-auto_save_obj :bool =True ,
-auto_save_glb :bool =True ,
-auto_save_ply :bool =True ,
-auto_save_stl :bool =True ,
-progress =gr .Progress ()):
-
-    global processing_core ,hi3dgen_pipeline 
-
-    def reset_birefnet_state ():
-
-        try :
-            if hi3dgen_pipeline and hasattr (hi3dgen_pipeline ,'reset_birefnet_state'):
-                print ("Cleanup: Resetting BiRefNet model state...")
-                hi3dgen_pipeline .reset_birefnet_state ()
-                print ("Cleanup: BiRefNet model state reset successfully")
-        except Exception as e :
-            print (f"Cleanup: Error resetting BiRefNet state: {e}")
-
-    if not processing_core :
-        print ("Error: ProcessingCore not initialized, falling back to legacy processing")
-        return generate_3d (image ,seed ,ss_guidance_strength ,ss_sampling_steps ,
-        slat_guidance_strength ,slat_sampling_steps ,poly_count_pcnt ,
-        xatlas_max_cost ,xatlas_normal_seam_weight ,xatlas_resolution ,xatlas_padding ,
-        normal_map_resolution ,normal_match_input_resolution ,
-        auto_save_obj ,auto_save_glb ,auto_save_ply ,auto_save_stl )
-
-    try :
-
-        start_single_processing ("Starting single image processing")
-
-        add_cleanup_callback (reset_birefnet_state )
-
-        def single_progress_callback (stage :str ,details :str =""):
-
-            try :
-
-                stage_progress ={
-                "Initialization":0.05 ,
-                "Normal Prediction":0.25 ,
-                "3D Generation":0.60 ,
-                "Mesh Processing":0.75 ,
-                "UV Unwrapping":0.85 ,
-                "File Export":0.95 ,
-                "Auto-save":0.98 ,
-                "Completed":1.0 
-                }
-
-                current_progress =0.0 
-                for stage_name ,prog in stage_progress .items ():
-                    if stage_name .lower ()in stage .lower ():
-                        current_progress =prog 
-                        break 
-
-                desc =f"{stage}: {details}"if details else stage 
-                progress (current_progress ,desc =desc )
-
-                print (f"Single Processing Progress: {desc} ({current_progress*100:.1f}%)")
-
-            except Exception as e :
-                print (f"Error in single progress callback: {e}")
-
-        progress (0.0 ,desc ="Starting single image processing...")
-
-        params =ProcessingParameters (
-        seed =seed ,
-        ss_guidance_strength =ss_guidance_strength ,
-        ss_sampling_steps =ss_sampling_steps ,
-        slat_guidance_strength =slat_guidance_strength ,
-        slat_sampling_steps =slat_sampling_steps ,
-        poly_count_pcnt =poly_count_pcnt ,
-        xatlas_max_cost =xatlas_max_cost ,
-        xatlas_normal_seam_weight =xatlas_normal_seam_weight ,
-        xatlas_resolution =xatlas_resolution ,
-        xatlas_padding =xatlas_padding ,
-        normal_map_resolution =normal_map_resolution ,
-        normal_match_input_resolution =normal_match_input_resolution ,
-        auto_save_obj =auto_save_obj ,
-        auto_save_glb =auto_save_glb ,
-        auto_save_ply =auto_save_ply ,
-        auto_save_stl =auto_save_stl 
-        )
-
-        result =processing_core .process_single_image (image ,params ,single_progress_callback )
-
-        if result .success :
-            progress (1.0 ,desc =f"✅ Completed successfully in {result.total_time:.1f}s")
-        else :
-            progress (0.0 ,desc =f"❌ Failed: {result.error_message}")
-
-        finish_processing ("Single processing completed"if result .success else "Single processing failed")
-
-        if result .success :
-            print (f"Single processing completed successfully: {result.get_summary()}")
-            return result .normal_image ,result .mesh_path ,result .mesh_path 
-        else :
-            print (f"Processing failed: {result.error_message}")
-            return None ,None ,None 
-
-    except Exception as e :
-        progress (0.0 ,desc =f"❌ Error: {str(e)}")
-        finish_processing (f"Single processing error: {str(e)}")
-        print (f"Error in generate_3d_with_cancellation: {e}")
-        import traceback 
-        traceback .print_exc ()
-
-        try :
-            progress (0.0 ,desc ="🔄 Falling back to legacy processing...")
-            result =generate_3d (image ,seed ,ss_guidance_strength ,ss_sampling_steps ,
-            slat_guidance_strength ,slat_sampling_steps ,poly_count_pcnt ,
-            xatlas_max_cost ,xatlas_normal_seam_weight ,xatlas_resolution ,xatlas_padding ,
-            normal_map_resolution ,normal_match_input_resolution ,
-            auto_save_obj ,auto_save_glb ,auto_save_ply ,auto_save_stl )
-            if result [1 ]is not None :
-                progress (1.0 ,desc ="✅ Legacy processing completed")
-            else :
-                progress (0.0 ,desc ="❌ Legacy processing failed")
-            return result 
-        except Exception as fallback_e :
-            progress (0.0 ,desc =f"❌ All processing failed: {str(fallback_e)}")
-            print (f"Fallback processing also failed: {fallback_e}")
-            return None ,None ,None 
-    finally :
-
-        try :
-            remove_cleanup_callback (reset_birefnet_state )
-        except :
-            pass 
-
-def generate_3d_multi_with_cancellation(files, mode="multidiffusion", seed=-1, 
-                                       ss_guidance_strength=3, ss_sampling_steps=50,
-                                       slat_guidance_strength=3, slat_sampling_steps=6,
-                                       poly_count_pcnt=0.5, xatlas_max_cost=8.0,
-                                       xatlas_normal_seam_weight=1.0, xatlas_resolution=1024,
-                                       xatlas_padding=2, normal_map_resolution=768,
-                                       normal_match_input_resolution=True,
-                                       auto_save_obj=True, auto_save_glb=True,
-                                       auto_save_ply=True, auto_save_stl=True,
-                                       progress=gr.Progress()):
-    """Generate 3D model from multiple input images - minimal wrapper using existing pipeline"""
-    from PIL import Image
-    
-    if not files or len(files) == 0:
-        print("No input images provided for multi-image generation.")
-        return None, None, None
-    
-    # Load images from uploaded files
-    images = []
-    for file in files:
-        try:
-            img = Image.open(file.name)
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            images.append(img)
-        except Exception as e:
-            print(f"Error loading image {file.name}: {e}")
-            continue
-    
-    if len(images) == 0:
-        print("No valid images loaded for multi-image generation.")
-        return None, None, None
-    
-    print(f"Processing {len(images)} images in {mode} mode...")
-    progress(0.1, desc=f"Loaded {len(images)} images")
-    
-    # Use existing pipeline's run_multi_image method directly
-    global hi3dgen_pipeline
-    if seed == -1:
-        seed = np.random.randint(0, MAX_SEED)
-    
-    try:
-        if torch.cuda.is_available():
-            progress(0.2, desc="Moving pipeline to GPU...")
-            hi3dgen_pipeline.cuda()
-        
-        progress(0.3, desc="Running multi-image Hi3DGen pipeline...")
-        outputs = hi3dgen_pipeline.run_multi_image(
-            images,
-            seed=seed,
-            formats=["mesh"],
-            preprocess_image=True,
-            mode=mode,
-            sparse_structure_sampler_params={"steps": ss_sampling_steps, "cfg_strength": ss_guidance_strength},
-            slat_sampler_params={"steps": slat_sampling_steps, "cfg_strength": slat_guidance_strength},
-        )
-        
-        progress(0.7, desc="Processing mesh...")
-        # Reuse existing mesh processing
-        timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
-        output_dir = os.path.join(TMP_DIR, timestamp)
-        os.makedirs(output_dir, exist_ok=True)
-        mesh_path_glb = os.path.join(output_dir, "mesh.glb")
-        
-        raw_mesh_trimesh = outputs['mesh'][0].to_trimesh(transform_pose=True)
-        mesh_for_uv_unwrap = simplify_mesh_open3d(raw_mesh_trimesh, poly_count_pcnt)
-        unwrapped_mesh_trimesh = unwrap_mesh_with_xatlas(
-            mesh_for_uv_unwrap,
-            max_cost_param=xatlas_max_cost,
-            normal_seam_weight_param=xatlas_normal_seam_weight,
-            resolution_param=xatlas_resolution,
-            padding_param=xatlas_padding
-        )
-        unwrapped_mesh_trimesh.export(mesh_path_glb)
-        
-        progress(0.9, desc="Auto-saving files...")
-        # Reuse existing auto-save system
-        if any([auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl]):
-            enabled_formats = {
-                "obj": auto_save_obj, "glb": auto_save_glb, 
-                "ply": auto_save_ply, "stl": auto_save_stl
-            }
-            first_preprocessed = hi3dgen_pipeline.preprocess_image(images[0]) if images else None
-            auto_save_generation(mesh_path_glb, first_preprocessed, enabled_formats)
-        
-        progress(1.0, desc="✅ Multi-image generation completed")
-        return first_preprocessed, mesh_path_glb, mesh_path_glb
-        
-    except Exception as e:
-        progress(0.0, desc=f"❌ Multi-image generation failed: {str(e)}")
-        print(f"Multi-image generation error: {e}")
-        return None, None, None
-    finally:
-        if torch.cuda.is_available():
-            hi3dgen_pipeline.cpu()
-            torch.cuda.empty_cache()
-
-def convert_mesh (mesh_path :str ,export_format :str )->Optional [str ]:
-
-    if not mesh_path or not os .path .exists (mesh_path ):
-        print (f"convert_mesh: Invalid input mesh_path: {mesh_path}")
-        return None 
-
-    try :
-
-        timestamp =datetime .datetime .now ().strftime ('%Y%m%d_%H%M%S')
-        filename =f"mesh_{timestamp}.{export_format.lower()}"
-        temp_file_path =os .path .join (TMP_DIR ,filename )
-
-        os .makedirs (os .path .dirname (temp_file_path ),exist_ok =True )
-
-        if export_format .lower ()=="glb"and mesh_path .lower ().endswith (".glb"):
-            print (f"convert_mesh: Copying GLB {mesh_path} to {temp_file_path}")
-            shutil .copy2 (mesh_path ,temp_file_path )
-            return temp_file_path 
-
-        print (f"convert_mesh: Converting {mesh_path} to {export_format} at {temp_file_path}")
-        mesh =trimesh .load_mesh (mesh_path )
-
-        if not (hasattr (mesh .visual ,'uv')and mesh .visual .uv is not None ):
-            print (f"  Warning: Loaded mesh from {mesh_path} has no UVs before export to {export_format}.")
-
-        mesh .export (temp_file_path ,file_type =export_format .lower ())
-
-        if not os .path .exists (temp_file_path )or os .path .getsize (temp_file_path )==0 :
-            raise Exception (f"Failed to create valid {export_format} file")
-
-        print (f"convert_mesh: Successfully created {export_format} file at {temp_file_path} ({os.path.getsize(temp_file_path)} bytes)")
-        return temp_file_path 
-
-    except Exception as e :
-        print (f"convert_mesh: Error during conversion of '{mesh_path}' to '{export_format}': {e}")
-        traceback .print_exc ()
-        if 'temp_file_path'in locals ()and temp_file_path and os .path .exists (temp_file_path ):
-            try :
-                os .remove (temp_file_path )
-            except Exception as rm_e :
-                print (f"convert_mesh: Error removing temp file {temp_file_path}: {rm_e}")
-        return None 
-
-custom_css ="""
-footer {visibility: hidden}
-#parameter-guide-content {
-    width: 100% !important;
-    height: 80vh !important;
-    max-width: none !important;
-    max-height: none !important;
-}
-#parameter-guide-content > div {
-    width: 100% !important;
-    height: 100% !important;
-    max-width: none !important;
-}
-.parameter-guide-tab {
-    width: 100% !important;
-    height: 100% !important;
-}
-/* Batch processing styles */
-.batch-status {
-    font-family: monospace;
-    background-color: #f8f9fa;
-    padding: 10px;
-    border-radius: 4px;
-}
-.batch-progress {
-    margin: 10px 0;
-}
-.cancel-button {
-    background-color: #dc3545 !important;
-    border-color: #dc3545 !important;
-}
-.processing-active {
-    animation: pulse 2s infinite;
-}
-@keyframes pulse {
-    0% { opacity: 1; }
-    50% { opacity: 0.7; }
-    100% { opacity: 1; }
-}
-/* Preset Management Styles */
-.preset-management {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    border-radius: 8px;
-    padding: 15px;
-    margin: 10px 0;
-    color: white;
-}
-.preset-dropdown {
-    background: white !important;
-    color: black !important;
-}
-.preset-save-btn {
-    background-color: #28a745 !important;
-    border-color: #28a745 !important;
-}
-.preset-load-btn {
-    background-color: #007bff !important;
-    border-color: #007bff !important;
-}
-.preset-delete-btn {
-    background-color: #dc3545 !important;
-    border-color: #dc3545 !important;
-}
-.preset-status-success {
-    background-color: #d4edda !important;
-    border-color: #c3e6cb !important;
-    color: #155724 !important;
-}
-.preset-status-error {
-    background-color: #f8d7da !important;
-    border-color: #f5c6cb !important;
-    color: #721c24 !important;
-}
-/* Enhanced progress display styles */
-.progress-container {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    border-radius: 8px;
-    padding: 15px;
-    margin: 10px 0;
-    color: white;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-}
-.status-success {
-    background-color: #d4edda !important;
-    border-color: #c3e6cb !important;
-    color: #155724 !important;
-}
-.status-error {
-    background-color: #f8d7da !important;
-    border-color: #f5c6cb !important;
-    color: #721c24 !important;
-}
-.status-processing {
-    background-color: #d1ecf1 !important;
-    border-color: #bee5eb !important;
-    color: #0c5460 !important;
-}
-.emoji-status {
-    font-size: 1.2em;
-    margin-right: 8px;
-}
-"""
-
-with gr .Blocks (css =custom_css ,theme =gr .themes .Soft ())as demo :
-    gr .Markdown (
-    "# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging SECourses App V17 with Auto-Save : https://www.patreon.com/posts/130766890"
-    )
-
-    with gr .Row ():
-        with gr .Column (scale =1 ):
-            with gr .Tabs ():
-
-                with gr .Tab ("Single Image"):
-                    with gr .Row ():
-                        image_prompt =gr .Image (label ="Image Prompt",image_mode ="RGBA",type ="pil")
-                        normal_output =gr .Image (label ="Normal Bridge",image_mode ="RGBA",type ="pil")
-                    with gr .Row ():
-                        gen_shape_btn =gr .Button ("Generate 3D Mesh",size ="lg",variant ="primary")
-                    with gr .Row ():
-                        processing_status_text =gr .Textbox (
-                label ="Processing Status",
-                value ="Idle",
-                interactive =False ,
-                scale =2 
-                )
-                    with gr .Row ():
-                        auto_save_obj_cb =gr .Checkbox (value =True ,label ="Auto-save OBJ",info ="Wavefront OBJ format")
-                        auto_save_glb_cb =gr .Checkbox (value =True ,label ="Auto-save GLB",info ="Binary glTF format")
-                    with gr .Row ():
-                        auto_save_ply_cb =gr .Checkbox (value =True ,label ="Auto-save PLY",info ="Stanford Triangle format")
-                        auto_save_stl_cb =gr .Checkbox (value =True ,label ="Auto-save STL",info ="Stereolithography format")
-
-                with gr .Tab ("🎭 Multiple Images"):
-                    gr .Markdown ("### Upload multiple angle views of your object (2-8 images recommended)")
-                    with gr .Row ():
-                        with gr .Column ():
-                            multi_image_inputs =gr .File (
-                                label ="Upload Multiple Images",
-                                file_count ="multiple",
-                                file_types =["image"],
-                                height =200 
-                            )
-                            with gr .Row ():
-                                multi_mode =gr .Radio (
-                                    choices =["multidiffusion","stochastic"],
-                                    value ="multidiffusion",
-                                    label ="Processing Mode",
-                                    info ="MultiDiffusion: Average all views (recommended). Stochastic: Cycle through views."
-                                )
-                            multi_gen_btn =gr .Button ("Generate 3D from Multiple Images",size ="lg",variant ="primary")
-                        with gr .Column ():
-                            multi_preview =gr .Gallery (
-                                label ="Preview Images",
-                                show_label =True ,
-                                elem_id ="multi_preview",
-                                columns =3 ,
-                                rows =2 ,
-                                height =200 
-                            )
-                            multi_normal_output =gr .Image (label ="Preprocessed First Image",image_mode ="RGBA",type ="pil")
-                    
-                    with gr .Row ():
-                        multi_processing_status_text =gr .Textbox (
-                        label ="Multi-Image Processing Status",
-                        value ="Idle",
-                        interactive =False ,
-                        scale =2 
-                        )
-                    
-                    with gr .Row ():
-                        multi_auto_save_obj_cb =gr .Checkbox (value =True ,label ="Auto-save OBJ",info ="Wavefront OBJ format")
-                        multi_auto_save_glb_cb =gr .Checkbox (value =True ,label ="Auto-save GLB",info ="Binary glTF format")
-                    with gr .Row ():
-                        multi_auto_save_ply_cb =gr .Checkbox (value =True ,label ="Auto-save PLY",info ="Stanford Triangle format")
-                        multi_auto_save_stl_cb =gr .Checkbox (value =True ,label ="Auto-save STL",info ="Stereolithography format")
-
-                with gr .Tab ("📦 Batch Processing"):
-                    with gr .Row ():
-                        with gr .Column (scale =1 ):
-                            gr .Markdown ("### Input Configuration")
-                            batch_input_folder =gr .Textbox (
-                            label ="Input Folder",
-                            placeholder ="Path to folder containing images",
-                            info ="Folder containing images to process (jpg, png, bmp, tiff, webp)"
-                            )
-                            batch_output_folder =gr .Textbox (
-                            label ="Output Folder",
-                            placeholder ="Path to save generated 3D models",
-                            info ="Folder where generated files will be saved"
-                            )
-
-                            with gr .Row ():
-                                batch_skip_existing =gr .Checkbox (
-                                value =True ,
-                                label ="Skip Existing Files",
-                                info ="Skip images that already have generated output files"
-                                )
-                                batch_use_current_settings =gr .Checkbox (
-                                value =True ,
-                                label ="Use Current Settings",
-                                info ="Use the advanced settings from the current session"
-                                )
-
-                        with gr .Column (scale =1 ):
-                            gr .Markdown ("### Batch Control")
-                            with gr .Row ():
-                                batch_start_btn =gr .Button (
-                                "🚀 Start Batch Processing",
-                                size ="lg",
-                                variant ="primary"
-                                )
-                                batch_cancel_btn =gr .Button (
-                                "⏹️ Cancel",
-                                size ="lg",
-                                variant ="stop"
-                                )
-
-                            batch_progress_bar =gr .Progress ()
-                            batch_status_text =gr .Textbox (
-                            label ="Status",
-                            value ="Ready",
-                            interactive =False ,
-                            lines =3 
-                            )
-
-                            batch_results_text =gr .Textbox (
-                            label ="Results Summary",
-                            value ="No batch processing started yet",
-                            interactive =False ,
-                            lines =5 
-                            )
-
-                with gr .Tab ("📋 Parameter Guide"):
-                    with gr .Row ():
-                        with gr .Column (scale =1 ):
-                            parameter_info_html =gr .HTML (
-                            value =format_parameter_info_html (),
-                            show_label =False ,
-                            elem_id ="parameter-guide-content"
-                            )
-
-
-                            
-
-            with gr .Accordion ("Advanced Settings",open =True ):
-                seed =gr .Slider (-1 ,MAX_SEED ,label ="Seed",value =0 ,step =1 )
-                gr .Markdown ("#### Stage 1: Sparse Structure Generation")
-                with gr .Row ():
-                    ss_guidance_strength =gr .Slider (0.0 ,10.0 ,label ="Guidance Strength",value =3 ,step =0.1 )
-                    ss_sampling_steps =gr .Slider (1 ,50 ,label ="Sampling Steps",value =50 ,step =1 )
-                gr .Markdown ("#### Stage 2: Structured Latent Generation")
-                with gr .Row ():
-                    slat_guidance_strength =gr .Slider (0.0 ,10.0 ,label ="Guidance Strength",value =3.0 ,step =0.1 )
-                    slat_sampling_steps =gr .Slider (1 ,50 ,label ="Sampling Steps",value =6 ,step =1 )
-
-                gr .Markdown ("#### Mesh Simplification Settings")
-                poly_count_slider =gr .Slider (
-                minimum =0.05 ,maximum =1.0 ,value =0.5 ,step =0.05 ,
-                label ="Polygon Count Percentage",
-                info ="Controls polygon retention post-simplification (e.g., 0.5 = 50%). Higher values = more detail, larger files."
-                )
-
-                gr .Markdown ("#### UV Unwrapping (xatlas) Settings")
-                with gr .Row ():
-                    xatlas_max_cost_slider =gr .Slider (
-                    minimum =1.0 ,maximum =10.0 ,value =8.0 ,step =0.1 ,
-                    label ="Max Chart Cost",
-                    info ="xatlas: Higher values allow more stretch/distortion within a UV chart."
-                    )
-                    xatlas_normal_seam_weight_slider =gr .Slider (
-                    minimum =0.1 ,maximum =5.0 ,value =1.0 ,step =0.1 ,
-                    label ="Normal Seam Weight",
-                    info ="xatlas: Lower values reduce UV seams based on normal changes."
-                    )
-                with gr .Row ():
-                    xatlas_resolution_slider =gr .Slider (
-                    minimum =256 ,maximum =4096 ,value =1024 ,step =256 ,
-                    label ="UV Atlas Resolution",
-                    info ="xatlas: Resolution of the UV texture atlas (e.g., 1024 for 1K)."
-                    )
-                    xatlas_padding_slider =gr .Slider (
-                    minimum =0 ,maximum =16 ,value =2 ,step =1 ,
-                    label ="UV Chart Padding",
-                    info ="xatlas: Padding in pixels between UV charts in the atlas."
-                    )
-
-                gr .Markdown ("#### Normal Map Generation Settings")
-                with gr .Row ():
-                    normal_map_resolution_slider =gr .Slider (
-                    minimum =256 ,maximum =1024 ,value =768 ,step =128 ,
-                    label ="Normal Map Resolution",
-                    info ="Target resolution for the generated normal map."
-                    )
-                    normal_match_input_res_checkbox =gr .Checkbox (
-                    value =True ,
-                    label ="Match Input Resolution for Normals",
-                    info ="If input image is smaller than 'Normal Map Resolution', use its resolution."
-                    )
-
-        with gr .Column (scale =1 ):
-
-            with gr .Row ():
-                universal_cancel_btn =gr .Button (
-                "⏹️ Cancel Processing",
-                size ="lg",
-                variant ="stop",
-                visible =False 
-                )
-
-
-            with gr .Column ():
-                with gr .Row ():
-                    display_mode_dropdown = gr .Dropdown (
-                        choices =["solid", "point_cloud", "wireframe"],
-                        value ="solid",
-                        label ="Display Mode",
-                        info ="Choose how to display the 3D model",
-                        scale =2
-                    )
-                    display_mode_btn = gr .Button ("Update Display", variant ="secondary", scale =1)
-                
-                model_output =gr .Model3D (label ="3D Model Preview (Each model is approximately 40MB, may take around 1 minute to load)",height=768)
-            with gr .Column ():
-                export_format =gr .Dropdown (
-                choices =["obj","glb","ply","stl"],
-                value ="glb",
-                label ="File Format"
-                )
-                download_btn =gr .DownloadButton (label ="Download 3D Mesh",interactive =False )
-
-                open_folder_btn =gr .Button ("📁 Open Outputs Folder",variant ="primary")
-                
-                gr .Markdown ("#### 📋 Preset Management")
-                with gr .Row ():
-                    preset_dropdown =gr .Dropdown (
-                        choices =["Default"],
-                        value ="Default",
-                        label ="Current Preset",
-                        info ="Select or load a saved preset",
-                        interactive =True 
-                    )
-                    preset_status_text =gr .Textbox (
-                        value ="📋 Presets: Ready",
-                        label ="Status",
-                        interactive =False ,
-                        scale =2 
-                    )
-                
-                with gr .Row ():
-                    with gr .Column (scale =2 ):
-                        preset_name_input =gr .Textbox (
-                            label ="New Preset Name",
-                            placeholder ="Enter preset name...",
-                            info ="Name for saving current settings"
-                        )
-                    with gr .Column (scale =3 ):
-                        preset_description_input =gr .Textbox (
-                            label ="Description (Optional)",
-                            placeholder ="Describe this preset...",
-                            info ="Optional description for the preset"
-                        )
-                
-                with gr .Row ():
-                    save_preset_btn =gr .Button ("💾 Save Preset",variant ="primary",scale =1 )
-                    load_preset_btn =gr .Button ("📂 Load Preset",variant ="secondary",scale =1 )
-                    delete_preset_btn =gr .Button ("🗑️ Delete",variant ="stop",scale =1 )
-                
-                preset_message_text =gr .Textbox (
-                    value ="Ready to manage presets",
-                    label ="Messages",
-                    interactive =False ,
-                    lines =2 
-                )
-                
-            with gr .Column ():
-                examples =gr .Examples (
-                examples =[
-                f'assets/example_image/{image}'
-                for image in os .listdir ("assets/example_image")
-                ],
-                inputs =image_prompt ,
-                examples_per_page =96 
-                )
-                
-                # Multi-image examples - reuse existing example_multi_image folder
-                if os .path .exists ("assets/example_multi_image"):
-                    multi_image_examples = []
-                    grouped_images = {}
-                    for filename in os .listdir ("assets/example_multi_image"):
-                        if filename .lower ().endswith (('.png', '.jpg', '.jpeg')):
-                            base_name = '_'.join (filename .split ('_')[:-1 ])
-                            if base_name not in grouped_images:
-                                grouped_images [base_name] = []
-                            grouped_images [base_name].append (f'assets/example_multi_image/{filename}')
-                    
-                    for obj_name, image_paths in grouped_images .items ():
-                        if len (image_paths) >= 2:
-                            image_paths .sort ()
-                            multi_image_examples .append (image_paths [:3 ])
-                    
-                    if multi_image_examples:
-                        multi_examples = gr .Examples (
-                            examples =multi_image_examples,
-                            inputs =multi_image_inputs,
-                            label ="Multi-view Example Sets"
-                        )
-
-    image_prompt .upload (
-    preprocess_image ,
-    inputs =[image_prompt ],
-    outputs =[image_prompt ]
-    )
-
-    def update_global_model_path_after_generation(normal_image, model_path, download_path):
-        """Update the global model path when a new model is generated."""
-        global current_model_path_global
-        if model_path:
-            current_model_path_global = model_path
-            print(f"Updated global model path to: {model_path}")
-        return normal_image, model_path, download_path
-
-    gen_shape_btn .click (
-    generate_3d_with_cancellation ,
-    inputs =[
-    image_prompt ,seed ,
-    ss_guidance_strength ,ss_sampling_steps ,
-    slat_guidance_strength ,slat_sampling_steps ,
-    poly_count_slider ,
-    xatlas_max_cost_slider ,
-    xatlas_normal_seam_weight_slider ,
-    xatlas_resolution_slider ,
-    xatlas_padding_slider ,
-    normal_map_resolution_slider ,
-    normal_match_input_res_checkbox ,
-    auto_save_obj_cb ,
-    auto_save_glb_cb ,
-    auto_save_ply_cb ,
-    auto_save_stl_cb 
-    ],
-    outputs =[normal_output ,model_output ,download_btn ],
-    show_progress =True 
-    ).then (
-    fn=update_global_model_path_after_generation,
-    inputs=[normal_output, model_output, download_btn],
-    outputs=[normal_output, model_output, download_btn]
-    ).then (
-    lambda :gr .Button (interactive =True ),
-    outputs =[download_btn ],
-    )
-
-    # Multi-image event handlers - minimal implementation
-    def process_multi_image_upload(files):
-        """Simple file upload processor"""
-        from PIL import Image
-        if not files:
-            return [], "No files uploaded"
-        
-        images = []
-        for f in files:
+"""Hi3DGen SECourses app (Gradio 6): 3D meshes from one image, several views or a whole folder of images."""
+import argparse
+import math
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import List, Optional
+
+ROOT = Path(__file__).resolve().parent
+os.environ.setdefault('SPCONV_ALGO', 'native')  # read when spconv is imported; override from the shell to experiment
+os.environ.setdefault('GRADIO_ANALYTICS_ENABLED', 'False')
+# Every model is read from the weights folder: never wait for (or call) the Hugging Face Hub, set to 0 to allow it
+os.environ.setdefault('HF_HUB_OFFLINE', '1')
+os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
+
+
+def configure_console():
+    """UTF-8 console output that never raises on characters the Windows code page cannot show."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if callable(reconfigure):
             try:
-                img = Image.open(f.name)
-                images.append(img)
-            except Exception as e:
-                print(f"Error loading image {f.name}: {e}")
-                continue
-        
-        return images, f"Loaded {len(images)} images"
+                reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+            except (OSError, TypeError, ValueError):
+                pass
 
-    multi_image_inputs .upload (
-        process_multi_image_upload,
-        inputs =[multi_image_inputs],
-        outputs =[multi_preview, multi_processing_status_text]
+
+configure_console()
+
+import gradio as gr
+import numpy as np
+import torch
+import trimesh
+from PIL import Image
+
+import ui_theme
+from ui_theme import btn, status_card
+from hi3dgen.pipelines import Hi3DGenPipeline
+from logic.auto_save import open_outputs_folder
+from logic.batch_processing import BatchSettings, create_batch_processor
+from logic.cancellation import (
+    ProcessingState, finish_processing, get_cancellation_manager, get_processing_status, request_cancellation,
+    should_cancel, start_single_processing,
+)
+from logic.parameter_info import format_parameter_info_html
+from logic.preset_file_manager import initialize_preset_file_system
+from logic.preset_manager import (
+    delete_preset_from_ui, get_preset_choices_for_ui, get_preset_status_for_ui, initialize_presets_for_ui,
+    load_preset_for_ui, save_preset_from_ui, validate_preset_name,
+)
+from logic.preset_validation import validate_ui_parameters
+from logic.processing_core import ProcessingCore, ProcessingParameters
+
+try:
+    from logic.system_status import print_system_status
+    SYSTEM_STATUS_AVAILABLE = True
+except ImportError as e:
+    print(f'System status module not available: {e}')
+    SYSTEM_STATUS_AVAILABLE = False
+
+APP_VERSION = 'V18'
+PATREON_URL = 'https://www.patreon.com/posts/130766890'
+MAX_SEED = int(np.iinfo(np.int32).max)
+TMP_DIR = str(ROOT / 'tmp')
+WEIGHTS_DIR = str(ROOT / 'weights')
+GPU = 'gpu'  # every event that uses the GPU shares this concurrency group, so they run one at a time
+EXPORT_FORMATS = ['obj', 'glb', 'ply', 'stl']
+DISPLAY_MODES = ['solid', 'point_cloud', 'wireframe']
+MODEL_LABEL = '3D Model Preview (each model is about 10-40 MB and may take a moment to load)'
+# Values of the settings in the order of the presets: seed, stage 1 guidance/steps, stage 2 guidance/steps, polygon
+# percentage, xatlas (max cost, normal seam weight, resolution, padding), normal map (resolution, match input), auto-save
+DEFAULT_VALUES = (-1, 3.0, 50, 3.0, 6, 0.5, 8.0, 1.0, 1024, 2, 768, True, True, True, True, True)
+
+# Weights the app needs, relative to WEIGHTS_DIR
+MODEL_FILES = {
+    'models--Stable-X--trellis-normal-v0-1': [
+        'pipeline.json', 'ckpts/ss_dec_conv3d_16l8_fp16.safetensors', 'ckpts/ss_flow_normal_dit_L_16l8_fp16.safetensors',
+        'ckpts/slat_flow_normal_dit_L_64l8p2_fp16.safetensors', 'ckpts/slat_dec_mesh_swin8_B_64l8m256c_fp16.safetensors',
+    ],
+    'models--Stable-X--yoso-normal-v1-8-1': [
+        'model_index.json', 'unet/diffusion_pytorch_model.fp16.safetensors', 'vae/diffusion_pytorch_model.fp16.safetensors',
+        'controlnet/controlnetvae.py', 'controlnet/diffusion_pytorch_model.fp16.safetensors',
+    ],
+    'models--ZhengPeng7--BiRefNet': ['config.json', 'model.safetensors'],
+    'github--facebookresearch--dinov2': ['hubconf.py'],
+    '.': ['dinov2_vitl14_reg4_pretrain.pth'],
+}
+
+# The processing system is created once in main(): one GPU, so one pipeline for every browser session
+hi3dgen_pipeline = None
+processing_core = None
+batch_processor = None
+cancellation_manager = None
+
+
+def verify_weights(weights_dir: str = WEIGHTS_DIR) -> bool:
+    """Check that the downloaded models are there. Nothing is downloaded here."""
+    print('Verifying the downloaded models...')
+    missing = []
+    for folder, files in MODEL_FILES.items():
+        base = Path(weights_dir) / folder
+        lacking = [name for name in files if not (base / name).is_file()]
+        label = folder if folder != '.' else 'weights'
+        if lacking:
+            missing.append(label)
+            print(f'  MISSING in {label}: {", ".join(lacking)}')
+        else:
+            print(f'  OK: {label}')
+    if missing:
+        print('\nSome models are missing. Run the model download of the installer (Windows_Resume_Model_Download.bat, '
+              'or `python DownloadModels.py` on Linux) and start the app again.')
+    return not missing
+
+
+# ----------------------------------------------------------------------------------------------------
+# Small helpers
+# ----------------------------------------------------------------------------------------------------
+def format_seconds(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 10:
+        return f'{seconds:.1f} s'
+    if seconds < 60:
+        return f'{seconds:.0f} s'
+    minutes, rest = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f'{minutes} min {rest:02d} s'
+    hours, minutes = divmod(minutes, 60)
+    return f'{hours} h {minutes:02d} min'
+
+
+def file_paths(files) -> List[str]:
+    """Paths of the files of a gr.File (strings, NamedString or dict, depending on the Gradio version)."""
+    paths = []
+    for item in files or []:
+        path = item.get('path') if isinstance(item, dict) else getattr(item, 'name', item)
+        if path:
+            paths.append(str(path))
+    return paths
+
+
+def clean_path(value) -> str:
+    """A folder typed or pasted by the user (Windows 'Copy as path' adds quotes)."""
+    return os.path.expanduser(str(value or '').strip().strip('"').strip("'"))
+
+
+def is_busy() -> bool:
+    return get_processing_status().processing_state not in (ProcessingState.IDLE, ProcessingState.CANCELLED)
+
+
+def int_value(value, default=0) -> int:
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def make_parameters(seed, ss_guidance_strength, ss_sampling_steps, slat_guidance_strength, slat_sampling_steps,
+                    poly_count_pcnt, xatlas_max_cost, xatlas_normal_seam_weight, xatlas_resolution, xatlas_padding,
+                    normal_map_resolution, normal_match_input_resolution,
+                    auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl) -> ProcessingParameters:
+    return ProcessingParameters(
+        seed=int_value(seed, -1),
+        ss_guidance_strength=float(ss_guidance_strength), ss_sampling_steps=int_value(ss_sampling_steps, 50),
+        slat_guidance_strength=float(slat_guidance_strength), slat_sampling_steps=int_value(slat_sampling_steps, 6),
+        poly_count_pcnt=float(poly_count_pcnt),
+        xatlas_max_cost=float(xatlas_max_cost), xatlas_normal_seam_weight=float(xatlas_normal_seam_weight),
+        xatlas_resolution=int_value(xatlas_resolution, 1024), xatlas_padding=int_value(xatlas_padding, 2),
+        normal_map_resolution=int_value(normal_map_resolution, 768),
+        normal_match_input_resolution=bool(normal_match_input_resolution),
+        auto_save_obj=bool(auto_save_obj), auto_save_glb=bool(auto_save_glb),
+        auto_save_ply=bool(auto_save_ply), auto_save_stl=bool(auto_save_stl),
     )
 
-    multi_gen_btn .click (
-        generate_3d_multi_with_cancellation,
-        inputs =[
-            multi_image_inputs, multi_mode, seed,
-            ss_guidance_strength, ss_sampling_steps,
-            slat_guidance_strength, slat_sampling_steps,
-            poly_count_slider,
-            xatlas_max_cost_slider,
-            xatlas_normal_seam_weight_slider,
-            xatlas_resolution_slider,
-            xatlas_padding_slider,
-            normal_map_resolution_slider,
-            normal_match_input_res_checkbox,
-            multi_auto_save_obj_cb,
-            multi_auto_save_glb_cb,
-            multi_auto_save_ply_cb,
-            multi_auto_save_stl_cb
-        ],
-        outputs =[multi_normal_output, model_output, download_btn],
-        show_progress =True
-    ).then (
-        fn=update_global_model_path_after_generation,
-        inputs=[multi_normal_output, model_output, download_btn],
-        outputs=[multi_normal_output, model_output, download_btn]
-    ).then (
-        lambda :gr .Button (interactive =True ),
-        outputs =[download_btn ],
-    )
 
-    # Global variable to store the current model path for display mode changes
-    current_model_path_global = None
+# ----------------------------------------------------------------------------------------------------
+# Live status of a running job
+# ----------------------------------------------------------------------------------------------------
+# Share of the progress bar of each stage. Most of the time goes into UV unwrapping (xatlas), which reports no progress.
+STAGE_RANGES = {
+    'Initialization': (0.00, 0.02), 'Preprocessing': (0.02, 0.06), 'Normal Prediction': (0.02, 0.06),
+    '3D Generation': (0.06, 0.20), 'Mesh Processing': (0.20, 0.27), 'UV Unwrapping': (0.27, 0.95),
+    'File Export': (0.95, 0.97), 'Auto-save': (0.97, 0.99), 'Completed': (1.0, 1.0),
+}
+SAMPLING_RANGES = {'Sparse structure': (0.06, 0.15), 'Structured latent': (0.15, 0.20)}
+# Stages without steps ease towards the end of their range with this time constant (seconds)
+EASE_SECONDS = {'Preprocessing': 3.0, 'Normal Prediction': 3.0, 'Mesh Processing': 6.0, 'UV Unwrapping': 60.0}
+SAMPLING_STEP = re.compile(r'^(?P<name>.+), step (?P<step>\d+)/(?P<total>\d+)$')
 
-    def store_model_path_and_clear_viewer(current_model_path: str, selected_display_mode: str):
-        """Store the current model path and clear the viewer."""
-        global current_model_path_global
-        current_model_path_global = current_model_path
-        
-        if not current_model_path:
-            print("No model loaded, updating display mode only")
-            return gr.Model3D(
-                value=None,
-                label=f"3D Model Preview - {selected_display_mode.title()} Mode (No model loaded)",
-                display_mode=selected_display_mode,
-                height=768
-            )
-        
-        print(f"Storing model path and clearing viewer for display mode: {selected_display_mode}")
-        
-        # Clear the viewer first (step 1 of delete/reload simulation)
-        return gr.Model3D(
-            value=None,
-            label=f"3D Model Preview - {selected_display_mode.title()} Mode (Refreshing...)",
-            display_mode=selected_display_mode,
-            height=768
-        )
 
-    def reload_3d_viewer_with_display_mode(selected_display_mode: str):
-        """Reload the 3D viewer with the stored model and new display mode."""
-        import time
-        global current_model_path_global
-        
+def stage_fraction(stage: str, details: str = '', stage_elapsed: float = 0.0) -> float:
+    low, high = STAGE_RANGES.get(stage, (0.0, 0.0))
+    if stage == '3D Generation':
+        match = SAMPLING_STEP.match(details or '')
+        if match:
+            step_low, step_high = SAMPLING_RANGES.get(match['name'], (low, high))
+            return step_low + (step_high - step_low) * (int(match['step']) - 1) / max(int(match['total']), 1)
+        return low
+    tau = EASE_SECONDS.get(stage)
+    if tau:
+        return low + (high - low) * 0.97 * (1.0 - math.exp(-max(stage_elapsed, 0.0) / tau))
+    return low
+
+
+class Run:
+    """One generation in a worker thread; the Gradio generator that started it polls it for the status card.
+
+    The work itself never touches Gradio: it reports through `report`, so the page keeps getting live updates, and a cancel
+    is just a flag the stages check (see logic/cancellation.py).
+    """
+
+    def __init__(self, label: str, first_stage: str = 'Normal map'):
+        self.label = label
+        self.first_stage = first_stage  # name of what happens before the 3D generation, for the final timings
+        self.started = time.monotonic()
+        self.stage, self.details, self.stage_started = 'Starting', '', self.started
+        self.seed = None
+        self.result = None
+        self.error: Optional[BaseException] = None
+        self.finished = threading.Event()
+        self._wake = threading.Event()
+        self._lock = threading.Lock()
+        self._preview = None
+        self._mesh_preview = None
+
+    # -- called by the worker
+    def report(self, stage: str, details: str = ''):
+        with self._lock:
+            if stage != self.stage:
+                self.stage, self.stage_started = stage, time.monotonic()
+            self.details = details
+            if details.startswith('Using seed '):
+                self.seed = details[len('Using seed '):]
+        self._wake.set()
+
+    def set_preview(self, image):
+        with self._lock:
+            self._preview = image
+        self._wake.set()
+
+    def set_mesh_preview(self, path):
+        with self._lock:
+            self._mesh_preview = path
+        self._wake.set()
+
+    # -- called by the generator
+    def take_preview(self):
+        with self._lock:
+            image, self._preview = self._preview, None
+        return image
+
+    def take_mesh_preview(self):
+        with self._lock:
+            path, self._mesh_preview = self._mesh_preview, None
+        return path
+
+    def snapshot(self):
+        with self._lock:
+            return self.stage, self.details, self.stage_started, self.seed
+
+    def start(self, work):
+        def main():
+            try:
+                self.result = work(self)
+            except BaseException as exc:  # reported on the status card, the thread must not die silently
+                self.error = exc
+                if isinstance(exc, RuntimeError) and 'already in' in str(exc):
+                    print(f'{self.label}: not started, {exc}')  # another job is running: expected, no traceback needed
+                else:
+                    traceback.print_exc()
+            finally:
+                self.finished.set()
+                self._wake.set()
+        threading.Thread(target=main, name='hi3dgen-job', daemon=True).start()
+        return self
+
+    def ticks(self, min_gap: float = 0.25, max_gap: float = 1.0):
+        """Yield whenever something changed (at most every `min_gap` s) or after `max_gap` s, until the job has ended."""
+        last = 0.0
+        while True:
+            self._wake.wait(timeout=max_gap)
+            self._wake.clear()
+            pause = min_gap - (time.monotonic() - last)
+            if pause > 0 and not self.finished.is_set():
+                time.sleep(pause)
+            last = time.monotonic()
+            yield
+            if self.finished.is_set():
+                return
+
+
+def cancellation_requested() -> bool:
+    try:
+        return bool(should_cancel())
+    except Exception:
+        return False
+
+
+def running_card(run: Run) -> str:
+    stage, details, stage_started, seed = run.snapshot()
+    now = time.monotonic()
+    text = f'{stage}: {details}' if details else stage
+    metrics = [('Stage', stage), ('Elapsed', format_seconds(now - run.started))]
+    if seed is not None:
+        metrics.append(('Seed', seed))
+    if stage == 'UV Unwrapping':
+        metrics.append(('Note', 'xatlas reports no progress, the bar is an estimate'))
+    cancelling = cancellation_requested()
+    headline = f'Cancelling, finishing the current step - {text}' if cancelling else f'{run.label}: {text}'
+    return status_card(headline, stage_fraction(stage, details, now - stage_started), metrics, 'warn' if cancelling else 'busy')
+
+
+def result_metrics(result, first_stage: str = 'Normal map') -> list:
+    metrics = [('Total', format_seconds(result.total_time))]
+    if result.normal_prediction_time:
+        metrics.append((first_stage, format_seconds(result.normal_prediction_time)))
+    metrics += [('3D generation', format_seconds(result.pipeline_time)), ('Mesh processing', format_seconds(result.mesh_processing_time)),
+                ('UV unwrapping', format_seconds(result.uv_unwrapping_time)),
+                ('Faces', f'{result.original_face_count:,} -> {result.simplified_face_count:,}'),
+                ('Vertices', f'{result.final_vertex_count:,}')]
+    if result.seed != -1:
+        metrics.append(('Seed', result.seed))
+    saved = (result.auto_save_result or {}).get('folder_path')
+    if saved:
         try:
-            # Small delay to ensure the clear operation is processed
-            time.sleep(0.1)
-            
-            if not current_model_path_global:
-                print("No stored model to reload")
-                return gr.Model3D(
-                    value=None,
-                    label=f"3D Model Preview - {selected_display_mode.title()} Mode (No model loaded)",
-                    display_mode=selected_display_mode,
-                    height=768
-                )
-            
-            print(f"Reloading 3D viewer with stored model: {current_model_path_global} and display mode: {selected_display_mode}")
-            
-            # Now reload with the stored model and new display mode (step 2 of delete/reload simulation)
-            return gr.Model3D(
-                value=current_model_path_global,
-                label=f"3D Model Preview - {selected_display_mode.title()} Mode (Each model is approximately 40MB, may take around 1 minute to load)",
-                display_mode=selected_display_mode,
-                height=768
-            )
-            
+            saved = str(Path(saved).resolve().relative_to(ROOT))
+        except ValueError:
+            pass
+        metrics.append(('Saved to', saved))
+    return metrics
+
+
+# ----------------------------------------------------------------------------------------------------
+# Meshes for the viewer and the download button
+# ----------------------------------------------------------------------------------------------------
+def prepare_download_file(mesh_path: Optional[str], export_format: str) -> Optional[str]:
+    """The mesh as `export_format`, next to the generated GLB (converted once, reused on later requests)."""
+    if not mesh_path or not os.path.exists(mesh_path):
+        return None
+    export_format = (export_format or 'glb').lower()
+    job_dir = os.path.dirname(os.path.abspath(mesh_path))
+    target = os.path.join(job_dir, f'generated_mesh_{os.path.basename(job_dir)}.{export_format}')
+    try:
+        if not os.path.exists(target) or os.path.getsize(target) == 0:
+            if export_format == 'glb' and mesh_path.lower().endswith('.glb'):
+                shutil.copy2(mesh_path, target)
+            else:
+                mesh = trimesh.load_mesh(mesh_path)
+                if not (hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None):
+                    print(f'  Warning: the mesh {mesh_path} has no UVs before export to {export_format}.')
+                mesh.export(target, file_type=export_format)
+            if not os.path.exists(target) or os.path.getsize(target) == 0:
+                raise RuntimeError(f'Failed to create a valid {export_format} file')
+        return target
+    except Exception as e:
+        print(f'prepare_download_file: could not create the {export_format} file for {mesh_path}: {e}')
+        traceback.print_exc()
+        if os.path.exists(target):
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+        return None
+
+
+def download_button(path: Optional[str], export_format: str):
+    if not path:
+        return gr.DownloadButton(value=None, interactive=False, label='Download 3D Mesh')
+    return gr.DownloadButton(value=path, interactive=True, label=f'Download {export_format.upper()}')
+
+
+def model_viewer(path: Optional[str], display_mode: str):
+    return gr.Model3D(value=path, display_mode=display_mode if display_mode in DISPLAY_MODES else 'solid', label=MODEL_LABEL)
+
+
+# ----------------------------------------------------------------------------------------------------
+# Generation events
+# ----------------------------------------------------------------------------------------------------
+def preprocess_image(image):
+    """Remove the background of an uploaded image (BiRefNet): on the GPU, or on the CPU while a generation uses the GPU."""
+    if image is None:
+        return None
+    if hi3dgen_pipeline is None:
+        raise gr.Error('The Hi3DGen pipeline is not loaded.')
+    device = 'cpu' if is_busy() else None
+    try:
+        return hi3dgen_pipeline.preprocess_image(image, resolution=1024, device=device)
+    except Exception as e:
+        print(f'Background removal failed: {e}')
+        traceback.print_exc()
+        message = str(e)
+        if 'BiRefNet' in message or '401' in message or 'RepositoryNotFoundError' in message:
+            print('Resetting the BiRefNet state and trying once more...')
+            try:
+                if hasattr(hi3dgen_pipeline, 'reset_birefnet_state'):
+                    hi3dgen_pipeline.reset_birefnet_state()
+                return hi3dgen_pipeline.preprocess_image(image, resolution=1024, device=device)
+            except Exception as retry_error:
+                print(f'Retry after the BiRefNet reset also failed: {retry_error}')
+                raise gr.Error(f'Background removal failed: {retry_error}')
+        raise gr.Error(f'Background removal failed: {e}')
+
+
+def restore_previous_model(previous_model, display_mode: str, export_format: str):
+    """(viewer, download button, model path) that show the model of the earlier run again, or nothing when there was none."""
+    if previous_model and os.path.exists(previous_model):
+        return (model_viewer(previous_model, display_mode), download_button(prepare_download_file(previous_model, export_format), export_format),
+                previous_model)
+    return model_viewer(None, display_mode), download_button(None, export_format), None
+
+
+def stream_generation(run: Run, work, display_mode: str, export_format: str, previous_model=None):
+    """Run `work` and stream (preview image, 3D model, download button, status card, model path) to the page.
+
+    `previous_model` is the mesh the viewer showed before: it comes back when this run fails or is cancelled after its
+    own mesh preview replaced it.
+    """
+    skip = gr.skip()
+    run.start(work)
+    preview_sent = False
+    mesh_preview_shown = False
+    for _ in run.ticks():
+        preview = run.take_preview()
+        mesh_preview = run.take_mesh_preview()
+        preview_sent = preview_sent or preview is not None
+        mesh_preview_shown = mesh_preview_shown or bool(mesh_preview)
+        # The decimated mesh is the final shape: it is shown while the UVs are computed, the download waits for the final file
+        yield (preview if preview is not None else skip,
+               model_viewer(mesh_preview, display_mode) if mesh_preview else skip,
+               download_button(None, export_format) if mesh_preview else skip,
+               running_card(run),
+               mesh_preview if mesh_preview else skip)
+
+    result = run.result
+    if run.error is not None:
+        message = str(run.error)
+        if isinstance(run.error, RuntimeError) and 'already in' in message:
+            message = 'Another job is still running (for example one started from a page that was closed). Wait for it or cancel it.'
+        viewer, download, model_path = restore_previous_model(previous_model, display_mode, export_format) if mesh_preview_shown else (skip, skip, skip)
+        yield (skip, viewer, download, status_card(f'{run.label} failed', None, [('Error', message)], 'error'), model_path)
+    elif result is None or not result.success or not result.mesh_path:
+        message = (result.error_message if result else None) or 'Unknown error'
+        if message.startswith('Cancelled'):
+            card = status_card(f'{run.label} cancelled', None, [('Elapsed', format_seconds(time.monotonic() - run.started)), ('Where', message)], 'warn')
+        else:
+            card = status_card(f'{run.label} failed', None, [('Error', message), ('Elapsed', format_seconds(time.monotonic() - run.started))], 'error')
+        viewer, download, model_path = restore_previous_model(previous_model, display_mode, export_format) if mesh_preview_shown else (skip, skip, skip)
+        yield (result.normal_image if (result and not preview_sent) else skip, viewer, download, card, model_path)
+    else:
+        yield (skip if preview_sent else result.normal_image, model_viewer(result.mesh_path, display_mode),
+               gr.DownloadButton(interactive=False, label='Preparing download...'),
+               status_card(f'{run.label} finished', 1.0, result_metrics(result, run.first_stage), 'ok'), result.mesh_path)
+        path = prepare_download_file(result.mesh_path, export_format)
+        yield (skip, skip, download_button(path, export_format), skip, skip)
+
+
+def start_job(name: str, work_fn):
+    """Wrap `work_fn(run)` in the global cancellation state, which is what the cancel button flips."""
+    def work(run: Run):
+        start_single_processing(f'Starting {name}')
+        try:
+            result = work_fn(run)
+            return result
+        finally:
+            finish_processing(f'{name} finished')
+    return work
+
+
+def generate_3d_with_cancellation(image, seed, ss_guidance_strength, ss_sampling_steps, slat_guidance_strength,
+                                  slat_sampling_steps, poly_count_pcnt, xatlas_max_cost, xatlas_normal_seam_weight,
+                                  xatlas_resolution, xatlas_padding, normal_map_resolution, normal_match_input_resolution,
+                                  auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl,
+                                  export_format='glb', display_mode='solid', previous_model=None):
+    """Single image: normal map, 3D generation, mesh processing, UV unwrapping, export and auto-save."""
+    skip = gr.skip()
+    if image is None:
+        gr.Warning('Upload an image or pick an example first.')
+        yield skip, skip, skip, status_card('Upload an image or pick an example first', None, tone='warn'), skip
+        return
+    if processing_core is None:
+        raise gr.Error('The processing system is not initialized, see the console.')
+    params = make_parameters(seed, ss_guidance_strength, ss_sampling_steps, slat_guidance_strength, slat_sampling_steps,
+                             poly_count_pcnt, xatlas_max_cost, xatlas_normal_seam_weight, xatlas_resolution, xatlas_padding,
+                             normal_map_resolution, normal_match_input_resolution,
+                             auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl)
+    run = Run('Single image')
+    work = start_job('single image processing',
+                     lambda r: processing_core.process_single_image(image, params, r.report, preview_callback=r.set_preview,
+                                                                    mesh_preview_callback=r.set_mesh_preview))
+    yield from stream_generation(run, work, display_mode, export_format, previous_model)
+
+
+def generate_3d_multi_with_cancellation(files, mode, seed, ss_guidance_strength, ss_sampling_steps, slat_guidance_strength,
+                                        slat_sampling_steps, poly_count_pcnt, xatlas_max_cost, xatlas_normal_seam_weight,
+                                        xatlas_resolution, xatlas_padding, normal_map_resolution,
+                                        normal_match_input_resolution, auto_save_obj, auto_save_glb, auto_save_ply,
+                                        auto_save_stl, export_format='glb', display_mode='solid', previous_model=None):
+    """Several views of one object: background removal per view, one 3D generation, then the same mesh steps."""
+    skip = gr.skip()
+    images = []
+    for path in file_paths(files):
+        try:
+            with Image.open(path) as img:
+                images.append(img.convert('RGB'))
         except Exception as e:
-            print(f"Error reloading 3D viewer: {e}")
-            import traceback
-            traceback.print_exc()
-            # Return fallback state
-            return gr.Model3D(
-                value=current_model_path_global,
-                label="3D Model Preview - Error reloading",
-                display_mode="solid",
-                height=768
-            )
+            print(f'Error loading image {path}: {e}')
+    if not images:
+        gr.Warning('Upload at least one valid image first.')
+        yield skip, skip, skip, status_card('Upload the views of your object first', None, tone='warn'), skip
+        return
+    if processing_core is None:
+        raise gr.Error('The processing system is not initialized, see the console.')
+    params = make_parameters(seed, ss_guidance_strength, ss_sampling_steps, slat_guidance_strength, slat_sampling_steps,
+                             poly_count_pcnt, xatlas_max_cost, xatlas_normal_seam_weight, xatlas_resolution, xatlas_padding,
+                             normal_map_resolution, normal_match_input_resolution,
+                             auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl)
+    print(f'Processing {len(images)} images in {mode} mode...')
+    run = Run(f'{len(images)} images', first_stage='Background removal')
+    work = start_job('multi-image processing',
+                     lambda r: processing_core.process_multi_image(images, mode, params, r.report, preview_callback=r.set_preview,
+                                                                   mesh_preview_callback=r.set_mesh_preview))
+    yield from stream_generation(run, work, display_mode, export_format, previous_model)
 
-    def prepare_download_file (mesh_path_from_model_output :str ,selected_format :str ):
 
-        if not mesh_path_from_model_output :
-            return None 
+def cancel_processing_ui():
+    """Stop the running generation or batch: the stages check the flag, a running mesh worker is killed at once."""
+    try:
+        if request_cancellation('User requested cancellation'):
+            gr.Info('Cancelling... the current step is finished first.')
+        else:
+            gr.Info('Nothing is running right now.')
+    except Exception as e:
+        print(f'Error requesting cancellation: {e}')
+        gr.Warning(f'Could not cancel: {e}')
 
-        converted_path =convert_mesh (mesh_path_from_model_output ,selected_format )
-        if not converted_path :
-            return None 
 
-        timestamp =datetime .datetime .now ().strftime ('%Y%m%d_%H%M%S')
-        final_filename =f"generated_mesh_{timestamp}.{selected_format.lower()}"
-        final_path =os .path .join (TMP_DIR ,final_filename )
+# ----------------------------------------------------------------------------------------------------
+# Batch
+# ----------------------------------------------------------------------------------------------------
+def batch_summary_text(progress, running: bool) -> str:
+    if progress.total_images == 0 and not progress.errors and not progress.skipped:
+        return 'No batch has been started yet.'
+    lines = [f'Images to process: {progress.total_images}', f'Processed: {progress.processed_images}',
+             f'Skipped (outputs already exist): {len(progress.skipped)}', f'Errors: {len(progress.errors)}']
+    if progress.cancelled_images:
+        lines.append(f'Cancelled: {progress.cancelled_images}')
+    lines.append(f'Elapsed: {format_seconds(progress.elapsed_time)}')
+    if running and progress.estimated_time_remaining > 0:
+        lines.append(f'Estimated time left: {format_seconds(progress.estimated_time_remaining)}')
+    if progress.errors:
+        lines += ['', 'Errors:'] + [f'  - {error}' for error in progress.errors[-5:]]
+    if progress.skipped:
+        shown = progress.skipped[:5]
+        lines += ['', 'Skipped:'] + [f'  - {name}' for name in shown]
+        if len(progress.skipped) > len(shown):
+            lines.append(f'  ... and {len(progress.skipped) - len(shown)} more')
+    return '\n'.join(lines)
 
-        try :
-            shutil .copy2 (converted_path ,final_path )
-            print (f"prepare_download_file: Created download file {final_path}")
-            return final_path 
-        except Exception as e :
-            print (f"prepare_download_file: Error creating final download file: {e}")
-            return converted_path 
 
-    def update_download_button (mesh_path_from_model_output :str ,selected_format :str ):
+def batch_card(progress, running: bool, tone: str, headline: str) -> str:
+    total = progress.total_images
+    active = list(progress.active.items())  # a copy: the batch threads change it while this runs
+    fraction = None
+    if total:
+        partial = sum(stage_fraction(text.split(':')[0]) for _, text in active)
+        finished = progress.processed_images + len(progress.errors) + progress.cancelled_images
+        fraction = min((finished + min(partial, 0.9 * len(active))) / total, 1.0)
+    metrics = [('Done', f'{progress.processed_images}/{total}'), ('Elapsed', format_seconds(progress.elapsed_time))]
+    if running and progress.estimated_time_remaining > 0:
+        metrics.append(('Time left', format_seconds(progress.estimated_time_remaining)))
+    if progress.errors:
+        metrics.append(('Errors', len(progress.errors)))
+    if progress.skipped:
+        metrics.append(('Skipped', len(progress.skipped)))
+    if running:
+        metrics += active[:4]  # what each image in progress is doing
+    return status_card(headline, fraction, metrics, tone)
 
-        if not mesh_path_from_model_output :
 
-            return gr .DownloadButton (interactive =False ,label ="Download 3D Mesh")
+def start_batch_processing_ui(input_folder, output_folder, skip_existing, use_current_settings,
+                              seed, ss_guidance_strength, ss_sampling_steps, slat_guidance_strength, slat_sampling_steps,
+                              poly_count_pcnt, xatlas_max_cost, xatlas_normal_seam_weight, xatlas_resolution,
+                              xatlas_padding, normal_map_resolution, normal_match_input_resolution,
+                              auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl):
+    """Process every image of a folder; streams (status card, results text, start button)."""
+    skip = gr.skip()
+    if batch_processor is None:
+        raise gr.Error('The batch processor is not initialized, see the console.')
+    input_folder, output_folder = clean_path(input_folder), clean_path(output_folder)
+    problem = None
+    if not input_folder or not output_folder:
+        problem = 'Please specify both the input and the output folder.'
+    elif not os.path.isdir(input_folder):
+        problem = f'The input folder does not exist: {input_folder}'
+    if problem:
+        gr.Warning(problem)
+        yield status_card(problem, None, tone='warn'), skip, skip
+        return
 
-        path_for_download =prepare_download_file (mesh_path_from_model_output ,selected_format )
-
-        if path_for_download :
-            print (f"update_download_button: Providing {path_for_download} for download as {selected_format}.")
-
-            return gr .DownloadButton (value =path_for_download ,interactive =True ,label =f"Download {selected_format.upper()}")
-        else :
-            print (f"update_download_button: Conversion failed for {selected_format}, button inactive.")
-            return gr .DownloadButton (interactive =False ,label ="Download 3D Mesh")
-
-    export_format .change (
-    update_download_button ,
-    inputs =[model_output ,export_format ],
-    outputs =[download_btn ]
+    values = (seed, ss_guidance_strength, ss_sampling_steps, slat_guidance_strength, slat_sampling_steps, poly_count_pcnt,
+              xatlas_max_cost, xatlas_normal_seam_weight, xatlas_resolution, xatlas_padding, normal_map_resolution,
+              normal_match_input_resolution, auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl)
+    chosen = make_parameters(*(values if use_current_settings else DEFAULT_VALUES))
+    settings = BatchSettings(
+        input_folder=input_folder, output_folder=output_folder, skip_existing=bool(skip_existing),
+        seed=chosen.seed, ss_guidance_strength=chosen.ss_guidance_strength, ss_sampling_steps=chosen.ss_sampling_steps,
+        slat_guidance_strength=chosen.slat_guidance_strength, slat_sampling_steps=chosen.slat_sampling_steps,
+        poly_count_pcnt=chosen.poly_count_pcnt, xatlas_max_cost=chosen.xatlas_max_cost,
+        xatlas_normal_seam_weight=chosen.xatlas_normal_seam_weight, xatlas_resolution=chosen.xatlas_resolution,
+        xatlas_padding=chosen.xatlas_padding, normal_map_resolution=chosen.normal_map_resolution,
+        normal_match_input_resolution=chosen.normal_match_input_resolution, auto_save_obj=chosen.auto_save_obj,
+        auto_save_glb=chosen.auto_save_glb, auto_save_ply=chosen.auto_save_ply, auto_save_stl=chosen.auto_save_stl,
     )
+    print('Starting batch processing:')
+    print(f'  Input folder: {input_folder}')
+    print(f'  Output folder: {output_folder}')
+    print(f'  Skip existing: {skip_existing}')
+    print(f'  Use current settings: {use_current_settings}')
 
-    # Display mode change handlers - using two-step process to simulate delete/reload
-    display_mode_btn .click (
-    fn =store_model_path_and_clear_viewer ,
-    inputs =[model_output ,display_mode_dropdown ],
-    outputs =[model_output ]
-    ).then (
-    fn =reload_3d_viewer_with_display_mode ,
-    inputs =[display_mode_dropdown ],
-    outputs =[model_output ]
+    run = Run('Batch')
+    run.start(lambda r: batch_processor.start_batch_processing(settings))
+    yield status_card('Batch: starting', None, [('Input', input_folder)], 'busy'), 'Starting...', gr.Button(interactive=False)
+    for _ in run.ticks(min_gap=0.5, max_gap=1.0):
+        progress = batch_processor.progress
+        headline = (f'Batch: {progress.processed_images} of {progress.total_images} images done' if progress.total_images
+                    else f'Batch: {progress.current_stage or "starting"}')
+        cancelling = cancellation_requested()
+        if cancelling:
+            headline = f'Cancelling, finishing the current images - {headline}'
+        yield (batch_card(progress, True, 'warn' if cancelling else 'busy', headline), batch_summary_text(progress, True), skip)
+
+    progress = batch_processor.progress
+    if run.error is not None:
+        card = status_card('Batch failed', None, [('Error', str(run.error))], 'error')
+        gr.Warning(f'Batch failed: {run.error}')
+    elif progress.current_stage.startswith('Cancelled'):
+        card = batch_card(progress, False, 'warn', f'Batch cancelled after {progress.processed_images} of {progress.total_images} images')
+    elif progress.total_images == 0 and progress.skipped:
+        card = batch_card(progress, False, 'ok', 'Nothing to do: every image already has its outputs')
+    elif progress.total_images == 0:
+        card = batch_card(progress, False, 'warn', progress.current_stage or 'No images found in the input folder')
+    elif progress.errors:
+        card = batch_card(progress, False, 'warn', f'Batch finished: {progress.processed_images} processed, {len(progress.errors)} failed')
+    else:
+        card = batch_card(progress, False, 'ok', f'Batch finished: {progress.processed_images} images processed')
+    yield card, batch_summary_text(progress, False), gr.Button(interactive=True)
+
+
+# ----------------------------------------------------------------------------------------------------
+# Performance
+# ----------------------------------------------------------------------------------------------------
+def memory_status_text() -> str:
+    if processing_core is None:
+        return 'Processing system not initialized'
+    return processing_core.memory.status()
+
+
+def set_memory_mode(mode):
+    if processing_core is not None:
+        if is_busy():
+            gr.Warning('The setting applies to the next generation, a job is running now.')
+        processing_core.memory.set_mode(mode)
+        gr.Info(f'Model memory mode: {processing_core.memory.mode}')
+    return memory_status_text()
+
+
+def free_gpu_memory_ui():
+    if processing_core is None:
+        return memory_status_text()
+    if is_busy():
+        gr.Warning('A generation is running. Wait for it to finish or cancel it first.')
+        return memory_status_text()
+    gr.Info(processing_core.memory.free_gpu_memory())
+    return memory_status_text()
+
+
+def set_mesh_jobs(count):
+    if batch_processor is not None:
+        gr.Info(f'Batch: up to {batch_processor.set_mesh_jobs(count)} meshes are unwrapped at the same time.')
+
+
+def open_outputs_folder_ui():
+    try:
+        open_outputs_folder()
+    except Exception as e:
+        print(f'Could not open the outputs folder: {e}')
+        gr.Warning(f'Could not open the outputs folder: {e}')
+
+
+# ----------------------------------------------------------------------------------------------------
+# Presets
+# ----------------------------------------------------------------------------------------------------
+def save_preset_ui_handler(preset_name, preset_description, *values):
+    """Save the current settings as a preset: (dropdown, message, status, name box, description box)."""
+    try:
+        is_valid, validation_message = validate_preset_name(preset_name)
+        if not is_valid:
+            gr.Warning(validation_message)
+            return (gr.Dropdown(choices=get_preset_choices_for_ui()), f'❌ {validation_message}', get_preset_status_for_ui(),
+                    gr.skip(), gr.skip())
+        extra = ''
+        try:
+            all_valid, _, validation = validate_ui_parameters(
+                seed=values[0], ss_guidance_strength=values[1], ss_sampling_steps=values[2],
+                slat_guidance_strength=values[3], slat_sampling_steps=values[4], poly_count_pcnt=values[5],
+                xatlas_max_cost=values[6], xatlas_normal_seam_weight=values[7], xatlas_resolution=values[8],
+                xatlas_padding=values[9], normal_map_resolution=values[10], normal_match_input_resolution=values[11],
+                auto_save_obj=values[12], auto_save_glb=values[13], auto_save_ply=values[14], auto_save_stl=values[15])
+            if not all_valid:
+                print(f'Parameter validation warnings: {validation}')
+                extra = f' (parameter adjustments: {validation})'
+        except Exception as validation_error:
+            print(f'Parameter validation error: {validation_error}')
+        success, message, presets, selected = save_preset_from_ui(preset_name, preset_description, *values, overwrite=False)
+        if success:
+            gr.Info(f'Preset saved: {preset_name}')
+            return (gr.Dropdown(choices=presets, value=selected), f'✅ {message}{extra}', get_preset_status_for_ui(),
+                    '', '')
+        gr.Warning(message)
+        return gr.Dropdown(choices=presets, value=selected), f'❌ {message}', get_preset_status_for_ui(), gr.skip(), gr.skip()
+    except Exception as e:
+        print(f'Error saving preset: {e}')
+        traceback.print_exc()
+        gr.Warning(f'Error saving preset: {e}')
+        return gr.Dropdown(choices=get_preset_choices_for_ui()), f'❌ Error saving preset: {e}', 'Error in the preset system', gr.skip(), gr.skip()
+
+
+def load_preset_ui_handler(selected_preset):
+    """Load a preset into the settings: (dropdown, message, status, 16 setting values)."""
+    nothing = [gr.skip()] * len(DEFAULT_VALUES)
+    try:
+        if not selected_preset or not str(selected_preset).strip():
+            return (gr.Dropdown(choices=get_preset_choices_for_ui()), '⚠️ No preset selected', get_preset_status_for_ui(), *nothing)
+        success, message, presets, current, ui_values = load_preset_for_ui(selected_preset)
+        if success:
+            print(f"Loaded preset '{selected_preset}': seed={ui_values[0]}, polygon share={ui_values[5]:.2f}, UV resolution={ui_values[8]}")
+            return (gr.Dropdown(choices=presets, value=current), f'✅ {message}', get_preset_status_for_ui(), *ui_values)
+        gr.Warning(message)
+        return (gr.Dropdown(choices=presets, value=current), f'❌ {message}', get_preset_status_for_ui(), *nothing)
+    except Exception as e:
+        print(f'Error loading preset: {e}')
+        traceback.print_exc()
+        gr.Warning(f'Error loading preset: {e}')
+        return (gr.Dropdown(choices=get_preset_choices_for_ui()), f'❌ Error loading preset: {e}', 'Error in the preset system', *nothing)
+
+
+def delete_preset_ui_handler(selected_preset):
+    try:
+        if not selected_preset or not str(selected_preset).strip():
+            return gr.Dropdown(choices=get_preset_choices_for_ui()), '❌ No preset selected for deletion', get_preset_status_for_ui()
+        success, message, presets, current = delete_preset_from_ui(selected_preset)
+        (gr.Info if success else gr.Warning)(message)
+        return gr.Dropdown(choices=presets, value=current), f'{"✅" if success else "❌"} {message}', get_preset_status_for_ui()
+    except Exception as e:
+        print(f'Error deleting preset: {e}')
+        traceback.print_exc()
+        return gr.Dropdown(choices=get_preset_choices_for_ui()), f'❌ Error deleting preset: {e}', 'Error in the preset system'
+
+
+def initialize_preset_ui():
+    """Fill the settings from the last used preset when the page opens."""
+    try:
+        file_success, file_message = initialize_preset_file_system()
+        if not file_success:
+            print(f'Preset file system initialization failed: {file_message}')
+        success, message, presets, selected, ui_values = initialize_presets_for_ui()
+        if not success:
+            print(f'Preset system initialization failed: {message}')
+            presets, selected, ui_values = ['Default'], 'Default', DEFAULT_VALUES
+        return (gr.Dropdown(choices=presets, value=selected), 'Preset system ready', get_preset_status_for_ui(), *ui_values)
+    except Exception as e:
+        print(f'Critical error initializing the preset UI: {e}')
+        traceback.print_exc()
+        return (gr.Dropdown(choices=['Default'], value='Default'), f'❌ Preset system error: {e}', 'Preset system failed', *DEFAULT_VALUES)
+
+
+# ----------------------------------------------------------------------------------------------------
+# Interface
+# ----------------------------------------------------------------------------------------------------
+def example_images() -> List[str]:
+    folder = ROOT / 'assets' / 'example_image'
+    if not folder.is_dir():
+        return []
+    files = [p for p in folder.iterdir() if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp')]
+    files.sort(key=lambda p: (not p.stem.isdigit(), int(p.stem) if p.stem.isdigit() else 0, p.name))
+    return [str(p) for p in files]
+
+
+def example_multi_image_sets() -> List[List[str]]:
+    folder = ROOT / 'assets' / 'example_multi_image'
+    if not folder.is_dir():
+        return []
+    groups = {}
+    for path in sorted(folder.iterdir()):
+        if path.suffix.lower() in ('.png', '.jpg', '.jpeg'):
+            groups.setdefault('_'.join(path.stem.split('_')[:-1]), []).append(str(path))
+    return [paths[:3] for paths in groups.values() if len(paths) >= 2]
+
+
+def show_multi_images(files):
+    """Preview of the uploaded views and a hint about how many to use."""
+    gallery, names = [], []
+    for path in file_paths(files):
+        try:
+            with Image.open(path):
+                pass
+            gallery.append(path)
+            names.append(Path(path).name)
+        except Exception as e:
+            print(f'Error loading image {path}: {e}')
+    if not gallery:
+        return [], status_card('Upload the views of your object', None, tone='idle')
+    if len(gallery) < 2:
+        return gallery, status_card('1 image loaded: add more views, or use the Single Image tab', None, [('Files', ', '.join(names))], 'warn')
+    return gallery, status_card(f'{len(gallery)} images loaded', None, [('Files', ', '.join(names))], 'ok')
+
+
+def build_ui() -> gr.Blocks:
+    idle_card = status_card('Ready', None, [('State', 'Idle')], 'idle')
+    startup_memory = memory_status_text()
+    single_example_files = example_images()
+    multi_example_sets = example_multi_image_sets()
+
+    with gr.Blocks(title=f'Hi3DGen - SECourses App {APP_VERSION}', analytics_enabled=False, delete_cache=(3600, 2 * 86400)) as demo:
+        # Header: title and the light/dark switch (a pure client-side toggle, instant even while a job runs)
+        with gr.Row(elem_classes=['app-header']):
+            gr.Markdown(
+                f'# Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging\n'
+                f'SECourses App {APP_VERSION} with Auto-Save | [Premium release, tutorials and support]({PATREON_URL})',
+                container=False)
+            theme_button = gr.Button('🌗  Light / dark theme', elem_classes=btn('gray'), scale=0, min_width=230)
+        theme_button.click(None, None, None, js=ui_theme.TOGGLE_THEME_JS, api_visibility='private')
+
+        model_state = gr.State(None)  # path of the mesh in the viewer, per browser session
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                with gr.Tabs():
+                    with gr.Tab('Single Image'):
+                        with gr.Row():
+                            image_prompt = gr.Image(label='Image Prompt', image_mode='RGBA', type='pil', elem_id='image-prompt',
+                                                    buttons=['download', 'fullscreen'])
+                            normal_output = gr.Image(label='Normal Bridge', image_mode='RGBA', type='pil', elem_id='normal-output',
+                                                     buttons=['download', 'fullscreen'])
+                        with gr.Row():
+                            gen_shape_btn = gr.Button('Generate 3D Mesh', size='lg', variant='primary', elem_id='generate-btn',
+                                                      elem_classes=btn('emerald'))
+                            single_cancel_btn = gr.Button('Cancel', size='lg', variant='stop', elem_id='cancel-btn',
+                                                          elem_classes=btn('red'), scale=0, min_width=160)
+                        single_status = gr.HTML(idle_card, elem_id='single-status', container=False, padding=False)
+                        with gr.Row():
+                            auto_save_obj_cb = gr.Checkbox(value=True, label='Auto-save OBJ', info='Wavefront OBJ format')
+                            auto_save_glb_cb = gr.Checkbox(value=True, label='Auto-save GLB', info='Binary glTF format')
+                        with gr.Row():
+                            auto_save_ply_cb = gr.Checkbox(value=True, label='Auto-save PLY', info='Stanford Triangle format')
+                            auto_save_stl_cb = gr.Checkbox(value=True, label='Auto-save STL', info='Stereolithography format')
+
+                    with gr.Tab('🎭 Multiple Images'):
+                        gr.Markdown('### Upload multiple angle views of your object (2-8 images recommended)')
+                        with gr.Row():
+                            with gr.Column():
+                                multi_image_inputs = gr.File(label='Upload Multiple Images', file_count='multiple', file_types=['image'],
+                                                             height=200, elem_id='multi-files')
+                                multi_mode = gr.Radio(
+                                    choices=['multidiffusion', 'stochastic'], value='multidiffusion', label='Processing Mode',
+                                    info='MultiDiffusion: Average all views (recommended). Stochastic: Cycle through views.')
+                            with gr.Column():
+                                multi_preview = gr.Gallery(label='Preview Images', show_label=True, elem_id='multi_preview',
+                                                           columns=3, rows=2, height=200, interactive=False)
+                                multi_normal_output = gr.Image(label='Preprocessed First Image', image_mode='RGBA', type='pil',
+                                                               elem_id='multi-preview-image', buttons=['download', 'fullscreen'])
+                        with gr.Row():
+                            multi_gen_btn = gr.Button('Generate 3D from Multiple Images', size='lg', variant='primary',
+                                                      elem_id='multi-generate-btn', elem_classes=btn('teal'))
+                            multi_cancel_btn = gr.Button('Cancel', size='lg', variant='stop', elem_id='multi-cancel-btn',
+                                                         elem_classes=btn('red'), scale=0, min_width=160)
+                        multi_status = gr.HTML(idle_card, elem_id='multi-status', container=False, padding=False)
+                        with gr.Row():
+                            multi_auto_save_obj_cb = gr.Checkbox(value=True, label='Auto-save OBJ', info='Wavefront OBJ format')
+                            multi_auto_save_glb_cb = gr.Checkbox(value=True, label='Auto-save GLB', info='Binary glTF format')
+                        with gr.Row():
+                            multi_auto_save_ply_cb = gr.Checkbox(value=True, label='Auto-save PLY', info='Stanford Triangle format')
+                            multi_auto_save_stl_cb = gr.Checkbox(value=True, label='Auto-save STL', info='Stereolithography format')
+
+                    with gr.Tab('📦 Batch Processing'):
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Markdown('### Input Configuration')
+                                batch_input_folder = gr.Textbox(
+                                    label='Input Folder', placeholder='Path to folder containing images', elem_id='batch-input',
+                                    info='Folder containing images to process (jpg, png, bmp, tiff, webp)')
+                                batch_output_folder = gr.Textbox(
+                                    label='Output Folder', placeholder='Path to save generated 3D models', elem_id='batch-output',
+                                    info='Folder where generated files will be saved')
+                                with gr.Row():
+                                    batch_skip_existing = gr.Checkbox(
+                                        value=True, label='Skip Existing Files',
+                                        info='Skip images that already have generated output files')
+                                    batch_use_current_settings = gr.Checkbox(
+                                        value=True, label='Use Current Settings',
+                                        info='Use the advanced settings from the current session')
+                            with gr.Column(scale=1):
+                                gr.Markdown('### Batch Control')
+                                with gr.Row():
+                                    batch_start_btn = gr.Button('🚀 Start Batch Processing', size='lg', variant='primary',
+                                                                elem_id='batch-start-btn', elem_classes=btn('emerald'))
+                                    batch_cancel_btn = gr.Button('⏹️ Cancel', size='lg', variant='stop', elem_id='batch-cancel-btn',
+                                                                 elem_classes=btn('red'))
+                                batch_status = gr.HTML(status_card('Ready', None, [('State', 'Idle')], 'idle'), elem_id='batch-status',
+                                                       container=False, padding=False)
+                                batch_results_text = gr.Textbox(label='Results Summary', value='No batch has been started yet.',
+                                                                interactive=False, lines=6, elem_id='batch-results')
+
+                    with gr.Tab('📋 Parameter Guide'):
+                        gr.HTML(value=format_parameter_info_html(), show_label=False, elem_id='parameter-guide-content')
+
+                with gr.Accordion('Advanced Settings', open=True):
+                    seed = gr.Slider(-1, MAX_SEED, label='Seed', value=0, step=1, elem_id='seed',
+                                     info='-1 picks a random seed; the seed used is shown after each run.')
+                    gr.Markdown('#### Stage 1: Sparse Structure Generation')
+                    with gr.Row():
+                        ss_guidance_strength = gr.Slider(0.0, 10.0, label='Guidance Strength', value=3, step=0.1)
+                        ss_sampling_steps = gr.Slider(1, 50, label='Sampling Steps', value=50, step=1)
+                    gr.Markdown('#### Stage 2: Structured Latent Generation')
+                    with gr.Row():
+                        slat_guidance_strength = gr.Slider(0.0, 10.0, label='Guidance Strength', value=3.0, step=0.1)
+                        slat_sampling_steps = gr.Slider(1, 50, label='Sampling Steps', value=6, step=1)
+
+                    gr.Markdown('#### Mesh Simplification Settings')
+                    poly_count_slider = gr.Slider(
+                        minimum=0.05, maximum=1.0, value=0.5, step=0.05, label='Polygon Count Percentage',
+                        info='Controls polygon retention post-simplification (e.g., 0.5 = 50%). Higher values = more detail, larger files.')
+
+                    gr.Markdown('#### UV Unwrapping (xatlas) Settings')
+                    with gr.Row():
+                        xatlas_max_cost_slider = gr.Slider(
+                            minimum=1.0, maximum=10.0, value=8.0, step=0.1, label='Max Chart Cost',
+                            info='xatlas: Higher values allow more stretch/distortion within a UV chart.')
+                        xatlas_normal_seam_weight_slider = gr.Slider(
+                            minimum=0.1, maximum=5.0, value=1.0, step=0.1, label='Normal Seam Weight',
+                            info='xatlas: Lower values reduce UV seams based on normal changes.')
+                    with gr.Row():
+                        xatlas_resolution_slider = gr.Slider(
+                            minimum=256, maximum=4096, value=1024, step=256, label='UV Atlas Resolution',
+                            info='xatlas: Resolution of the UV texture atlas (e.g., 1024 for 1K).')
+                        xatlas_padding_slider = gr.Slider(
+                            minimum=0, maximum=16, value=2, step=1, label='UV Chart Padding',
+                            info='xatlas: Padding in pixels between UV charts in the atlas.')
+
+                    gr.Markdown('#### Normal Map Generation Settings')
+                    with gr.Row():
+                        normal_map_resolution_slider = gr.Slider(
+                            minimum=256, maximum=1024, value=768, step=128, label='Normal Map Resolution',
+                            info='Target resolution for the generated normal map.')
+                        normal_match_input_res_checkbox = gr.Checkbox(
+                            value=True, label='Match Input Resolution for Normals',
+                            info="If input image is smaller than 'Normal Map Resolution', use its resolution.")
+
+                with gr.Accordion('Performance', open=False):
+                    memory_mode = gr.Radio(
+                        choices=['auto', 'keep', 'offload'], value=processing_core.memory.mode if processing_core else 'auto',
+                        label='Model memory',
+                        info='auto: keep the models on the GPU between generations when it has 20 GB or more (fastest), '
+                             'otherwise move them to the CPU after each stage. keep: always on the GPU. offload: always move them away.')
+                    memory_status = gr.Textbox(label='GPU memory', value=startup_memory, interactive=False)
+                    with gr.Row():
+                        free_memory_btn = gr.Button('Free GPU memory', elem_classes=btn('amber'), elem_id='free-gpu-btn')
+                        refresh_memory_btn = gr.Button('Refresh', elem_classes=btn('slate'))
+                    mesh_jobs_slider = gr.Slider(
+                        1, 8, value=batch_processor.mesh_jobs if batch_processor else 2, step=1, label='Batch: meshes unwrapped at the same time',
+                        info='While the GPU works on the next image, up to this many finished meshes are decimated and UV-unwrapped '
+                             'in separate processes (about 1 GB and 3 CPU cores each).')
+
+            with gr.Column(scale=1):
+                with gr.Row():
+                    display_mode_dropdown = gr.Dropdown(choices=DISPLAY_MODES, value='solid', label='Display Mode',
+                                                        info='Choose how to display the 3D model', scale=2)
+                    display_mode_btn = gr.Button('Update Display', elem_classes=btn('sky'), scale=1)
+                model_output = gr.Model3D(label=MODEL_LABEL, height=768, elem_id='model-viewer')
+                export_format = gr.Dropdown(choices=EXPORT_FORMATS, value='glb', label='File Format')
+                download_btn = gr.DownloadButton(label='Download 3D Mesh', interactive=False, elem_classes=btn('blue'),
+                                                 elem_id='download-btn')
+                open_folder_btn = gr.Button('📁 Open Outputs Folder', elem_classes=btn('indigo'), elem_id='open-outputs-btn')
+
+                gr.Markdown('#### 📋 Preset Management')
+                with gr.Row():
+                    preset_dropdown = gr.Dropdown(choices=['Default'], value='Default', label='Current Preset',
+                                                  info='Select or load a saved preset', interactive=True, elem_id='preset-dropdown')
+                    preset_status_text = gr.Textbox(value='📋 Presets: Ready', label='Status', interactive=False, scale=2)
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        preset_name_input = gr.Textbox(label='New Preset Name', placeholder='Enter preset name...',
+                                                       info='Name for saving current settings')
+                    with gr.Column(scale=3):
+                        preset_description_input = gr.Textbox(label='Description (Optional)', placeholder='Describe this preset...',
+                                                              info='Optional description for the preset')
+                with gr.Row():
+                    save_preset_btn = gr.Button('💾 Save Preset', elem_classes=btn('green'), scale=1)
+                    load_preset_btn = gr.Button('📂 Load Preset', elem_classes=btn('sky'), scale=1)
+                    delete_preset_btn = gr.Button('🗑️ Delete', elem_classes=btn('crimson'), scale=1)
+                preset_message_text = gr.Textbox(value='Ready to manage presets', label='Messages', interactive=False, lines=2)
+
+                gr.Examples(examples=single_example_files, inputs=image_prompt, examples_per_page=96, label='Example images')
+                if multi_example_sets:
+                    gr.Examples(examples=[[paths] for paths in multi_example_sets], inputs=multi_image_inputs,
+                                label='Multi-view Example Sets')
+
+        # ---- the settings, in the order of the presets
+        settings = [seed, ss_guidance_strength, ss_sampling_steps, slat_guidance_strength, slat_sampling_steps, poly_count_slider,
+                    xatlas_max_cost_slider, xatlas_normal_seam_weight_slider, xatlas_resolution_slider, xatlas_padding_slider,
+                    normal_map_resolution_slider, normal_match_input_res_checkbox]
+        single_saves = [auto_save_obj_cb, auto_save_glb_cb, auto_save_ply_cb, auto_save_stl_cb]
+        multi_saves = [multi_auto_save_obj_cb, multi_auto_save_glb_cb, multi_auto_save_ply_cb, multi_auto_save_stl_cb]
+        preset_values = settings + single_saves
+        generation_outputs = [normal_output, model_output, download_btn, single_status, model_state]
+        # The status card is where progress and the queue position show; the viewers update silently
+        progress_args = dict(show_progress='minimal', concurrency_id=GPU, concurrency_limit=1)
+
+        # ---- generation
+        # not in the GPU group: it must work while a generation runs (then on the CPU, see preprocess_image)
+        image_prompt.upload(preprocess_image, inputs=[image_prompt], outputs=[image_prompt], api_name='preprocess_image')
+        gen_shape_btn.click(
+            generate_3d_with_cancellation,
+            inputs=[image_prompt] + settings + single_saves + [export_format, display_mode_dropdown, model_state],
+            outputs=generation_outputs, api_name='generate_3d_with_cancellation', show_progress_on=[single_status], **progress_args)
+        multi_image_inputs.change(show_multi_images, inputs=[multi_image_inputs], outputs=[multi_preview, multi_status],
+                                  api_visibility='private', show_progress='hidden')
+        multi_gen_btn.click(
+            generate_3d_multi_with_cancellation,
+            inputs=[multi_image_inputs, multi_mode] + settings + multi_saves + [export_format, display_mode_dropdown, model_state],
+            outputs=[multi_normal_output, model_output, download_btn, multi_status, model_state],
+            api_name='generate_3d_multi_with_cancellation', show_progress_on=[multi_status], **progress_args)
+
+        # ---- cancel: queued without a limit and outside the GPU group, so it runs at once while the GPU is busy
+        # (a queue=False event could not show its toast message)
+        for cancel in (single_cancel_btn, multi_cancel_btn, batch_cancel_btn):
+            cancel.click(cancel_processing_ui, concurrency_limit=None, show_progress='hidden', trigger_mode='multiple',
+                         api_name='cancel_processing_ui' if cancel is batch_cancel_btn else None,
+                         api_visibility='public' if cancel is batch_cancel_btn else 'private')
+
+        # ---- batch
+        batch_start_btn.click(
+            start_batch_processing_ui,
+            inputs=[batch_input_folder, batch_output_folder, batch_skip_existing, batch_use_current_settings] + preset_values,
+            outputs=[batch_status, batch_results_text, batch_start_btn], api_name='start_batch_processing_ui',
+            show_progress_on=[batch_status], **progress_args)
+
+        # ---- viewer and download
+        # The viewer applies a display mode only while it loads a model, so a change is two steps: clear it, then load the
+        # mesh again. They are two events: a single generator that yields both leaves the viewer empty.
+        def clear_viewer(mode):
+            return model_viewer(None, mode)
+
+        def reload_viewer(model_path, mode):
+            time.sleep(0.1)  # lets the page process the clear first
+            return model_viewer(model_path, mode)
+
+        def change_format(model_path, fmt):
+            return download_button(prepare_download_file(model_path, fmt), fmt) if model_path else download_button(None, fmt)
+
+        quiet = dict(api_visibility='private', show_progress='hidden', concurrency_limit=None)
+        for trigger in (display_mode_btn.click, display_mode_dropdown.input):
+            trigger(clear_viewer, inputs=[display_mode_dropdown], outputs=[model_output], **quiet).then(
+                reload_viewer, inputs=[model_state, display_mode_dropdown], outputs=[model_output], **quiet)
+        export_format.input(change_format, inputs=[model_state, export_format], outputs=[download_btn], api_visibility='private',
+                            show_progress='hidden')
+        open_folder_btn.click(open_outputs_folder_ui, concurrency_limit=None, api_visibility='private', show_progress='hidden')
+
+        # ---- performance
+        memory_mode.input(set_memory_mode, inputs=[memory_mode], outputs=[memory_status], api_visibility='private',
+                          show_progress='hidden')
+        free_memory_btn.click(free_gpu_memory_ui, outputs=[memory_status], api_visibility='private', show_progress='hidden')
+        refresh_memory_btn.click(memory_status_text, outputs=[memory_status], api_visibility='private', show_progress='hidden',
+                                 concurrency_limit=None)
+        mesh_jobs_slider.release(set_mesh_jobs, inputs=[mesh_jobs_slider], api_visibility='private', show_progress='hidden',
+                                 concurrency_limit=None)
+
+        # ---- presets
+        preset_outputs = [preset_dropdown, preset_message_text, preset_status_text]
+        save_preset_btn.click(save_preset_ui_handler, inputs=[preset_name_input, preset_description_input] + preset_values,
+                              outputs=preset_outputs + [preset_name_input, preset_description_input], api_visibility='private',
+                              show_progress='hidden')
+        load_preset_btn.click(load_preset_ui_handler, inputs=[preset_dropdown], outputs=preset_outputs + preset_values,
+                              api_visibility='private', show_progress='hidden')
+        delete_preset_btn.click(delete_preset_ui_handler, inputs=[preset_dropdown], outputs=preset_outputs, api_visibility='private',
+                                show_progress='hidden')
+        preset_dropdown.input(load_preset_ui_handler, inputs=[preset_dropdown], outputs=preset_outputs + preset_values,
+                              api_visibility='private', show_progress='hidden')
+        demo.load(initialize_preset_ui, outputs=preset_outputs + preset_values, api_visibility='private', show_progress='hidden')
+        demo.load(memory_status_text, outputs=[memory_status], api_visibility='private', show_progress='hidden')
+
+    demo.queue(default_concurrency_limit=1, max_size=32)
+    return demo
+
+
+# ----------------------------------------------------------------------------------------------------
+# Start
+# ----------------------------------------------------------------------------------------------------
+def cleanup_processing_system():
+    """Stop running work and release the GPU when the app exits."""
+    try:
+        if cancellation_manager:
+            cancellation_manager.request_cancellation('System shutdown')
+        if processing_core is not None:
+            processing_core.memory.free_gpu_memory(quiet=True)
+    except Exception as e:
+        print(f'Error during cleanup: {e}')
+
+
+def initialize_processing_system(model_memory: Optional[str] = None, mesh_jobs: Optional[int] = None):
+    """Load the pipeline (to the CPU) and create the processing core, the batch processor and the cancellation manager."""
+    global hi3dgen_pipeline, processing_core, batch_processor, cancellation_manager
+    started = time.time()
+    print('Loading the Hi3DGen pipeline (CPU)...', flush=True)
+    hi3dgen_pipeline = Hi3DGenPipeline.from_pretrained(os.path.join(WEIGHTS_DIR, 'models--Stable-X--trellis-normal-v0-1'))
+    hi3dgen_pipeline.cpu()
+    print(f'Hi3DGen pipeline loaded in {time.time() - started:.1f}s.', flush=True)
+
+    os.makedirs(TMP_DIR, exist_ok=True)
+    processing_core = ProcessingCore(hi3dgen_pipeline=hi3dgen_pipeline, weights_dir=WEIGHTS_DIR, tmp_dir=TMP_DIR, max_seed=MAX_SEED)
+    if model_memory:
+        processing_core.memory.set_mode(model_memory)
+    batch_processor = create_batch_processor(processing_core, mesh_jobs)
+    cancellation_manager = get_cancellation_manager()
+    print(processing_core.memory.status())
+    print(f'Meshes unwrapped at the same time in a batch: {batch_processor.mesh_jobs}')
+    if SYSTEM_STATUS_AVAILABLE:
+        print('\n' + '=' * 60)
+        print_system_status(processing_core=processing_core, batch_processor=batch_processor, hi3dgen_pipeline=hi3dgen_pipeline,
+                            weights_dir=WEIGHTS_DIR, tmp_dir=TMP_DIR)
+        print('=' * 60)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description='Run the Hi3DGen Gradio App.')
+    parser.add_argument('--share', action='store_true', help='Enable Gradio sharing')
+    parser.add_argument('--host', default=None, help='Address to listen on (0.0.0.0 for the local network)')
+    parser.add_argument('--port', type=int, default=None, help='Port (default: the first free one from 7860)')
+    parser.add_argument('--no-browser', action='store_true', help='Do not open the browser')
+    parser.add_argument('--model-memory', choices=['auto', 'keep', 'offload'], default=None,
+                        help='GPU memory policy (default: HI3DGEN_MODEL_MEMORY or auto)')
+    parser.add_argument('--mesh-jobs', type=int, default=None, help='Batch: meshes unwrapped at the same time')
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    started = time.time()
+    args = parse_args(argv)
+    os.chdir(ROOT)  # the presets and the outputs live next to the app
+    print(f'Hi3DGen SECourses App {APP_VERSION}', flush=True)
+    verify_weights(WEIGHTS_DIR)
+
+    try:
+        initialize_processing_system(args.model_memory, args.mesh_jobs)
+    except Exception as e:
+        print(f'Error initializing the processing system: {e}')
+        traceback.print_exc()
+        print('Some features may not work properly.')
+
+    import atexit
+    atexit.register(cleanup_processing_system)
+
+    print('Building the interface...', flush=True)
+    demo = build_ui()
+    address = {}
+    if args.host:
+        address['server_name'] = args.host
+    if args.port:
+        address['server_port'] = args.port
+    demo.launch(
+        **address, share=args.share, inbrowser=not args.no_browser, show_error=True, favicon_path=str(ui_theme.FAVICON_PATH),
+        theme=ui_theme.app_theme(), css=ui_theme.APP_CSS, head=ui_theme.APP_HEAD,
+        # Gradio's run history writes every call's inputs and outputs to the browser's local storage
+        run_history=False, footer_links=['api', 'settings'],
+        allowed_paths=[str(ROOT / 'assets'), TMP_DIR, str(ROOT / 'outputs')],
+        prevent_thread_lock=True,
     )
-    
-    # Also update on dropdown change for immediate feedback
-    display_mode_dropdown .change (
-    fn =store_model_path_and_clear_viewer ,
-    inputs =[model_output ,display_mode_dropdown ],
-    outputs =[model_output ]
-    ).then (
-    fn =reload_3d_viewer_with_display_mode ,
-    inputs =[display_mode_dropdown ],
-    outputs =[model_output ]
-    )
+    print(f'Hi3DGen is ready at {demo.local_url} (startup {time.time() - started:.1f}s)', flush=True)
+    demo.block_thread()
+    return 0
 
-    open_folder_btn .click (
-    fn =lambda :open_outputs_folder (),
-    inputs =[],
-    outputs =[]
-    )
 
-    # Preset Management Functions
-    def save_preset_ui_handler (preset_name ,preset_description ,
-    seed ,ss_guidance_strength ,ss_sampling_steps ,
-    slat_guidance_strength ,slat_sampling_steps ,poly_count_pcnt ,
-    xatlas_max_cost ,xatlas_normal_seam_weight ,xatlas_resolution ,xatlas_padding ,
-    normal_map_resolution ,normal_match_input_resolution ,
-    auto_save_obj ,auto_save_glb ,auto_save_ply ,auto_save_stl ):
-        """Handle saving a preset from the UI with validation"""
-        try :
-            # Validate preset name
-            is_valid ,validation_message =validate_preset_name (preset_name )
-            if not is_valid :
-                return (
-                gr .Dropdown (choices =get_preset_choices_for_ui ()),# preset_dropdown 
-                f"❌ {validation_message}",# preset_message_text 
-                get_preset_status_for_ui (),# preset_status_text 
-                gr .Textbox (value =""),# clear preset_name_input 
-                gr .Textbox (value ="")# clear preset_description_input 
-                )
-            
-            # Validate parameters before saving
-            try :
-                from logic .preset_validation import validate_ui_parameters 
-                
-                param_validation_result =validate_ui_parameters (
-                seed =seed ,ss_guidance_strength =ss_guidance_strength ,ss_sampling_steps =ss_sampling_steps ,
-                slat_guidance_strength =slat_guidance_strength ,slat_sampling_steps =slat_sampling_steps ,
-                poly_count_pcnt =poly_count_pcnt ,xatlas_max_cost =xatlas_max_cost ,
-                xatlas_normal_seam_weight =xatlas_normal_seam_weight ,xatlas_resolution =xatlas_resolution ,
-                xatlas_padding =xatlas_padding ,normal_map_resolution =normal_map_resolution ,
-                normal_match_input_resolution =normal_match_input_resolution ,
-                auto_save_obj =auto_save_obj ,auto_save_glb =auto_save_glb ,
-                auto_save_ply =auto_save_ply ,auto_save_stl =auto_save_stl 
-                )
-                
-                all_params_valid ,sanitized_values ,param_message =param_validation_result 
-                
-                if not all_params_valid :
-                    print (f"⚠️ Parameter validation warnings: {param_message}")
-                    # Continue with sanitized values but warn user
-                    extra_message =f" (Parameter adjustments: {param_message})"
-                else :
-                    extra_message =""
-                    
-            except ImportError :
-                print ("⚠️ Parameter validation not available")
-                extra_message =""
-            except Exception as validation_error :
-                print (f"⚠️ Parameter validation error: {validation_error}")
-                extra_message =f" (Validation warning: {str(validation_error)})"
-            
-            print (f"💾 Saving preset '{preset_name}' with current parameters...")
-            print (f"   Parameters: seed={seed}, ss_guidance={ss_guidance_strength}, poly%={poly_count_pcnt:.2f}")
-            
-            # Save preset
-            success ,message ,updated_presets ,selected_preset =save_preset_from_ui (
-            preset_name ,preset_description ,
-            seed ,ss_guidance_strength ,ss_sampling_steps ,
-            slat_guidance_strength ,slat_sampling_steps ,poly_count_pcnt ,
-            xatlas_max_cost ,xatlas_normal_seam_weight ,xatlas_resolution ,xatlas_padding ,
-            normal_map_resolution ,normal_match_input_resolution ,
-            auto_save_obj ,auto_save_glb ,auto_save_ply ,auto_save_stl ,
-            overwrite =False # For now, don't allow overwrite without confirmation
-            )
-            
-            if success :
-                status_msg =f"✅ {message}{extra_message}"
-                clear_inputs =True 
-                print (f"✅ Preset '{preset_name}' saved successfully")
-            else :
-                status_msg =f"❌ {message}"
-                clear_inputs =False 
-                print (f"❌ Failed to save preset '{preset_name}': {message}")
-            
-            return (
-            gr .Dropdown (choices =updated_presets ,value =selected_preset ),# preset_dropdown 
-            status_msg ,# preset_message_text 
-            get_preset_status_for_ui (),# preset_status_text 
-            gr .Textbox (value =""if clear_inputs else preset_name ),# preset_name_input 
-            gr .Textbox (value =""if clear_inputs else preset_description )# preset_description_input 
-            )
-            
-        except Exception as e :
-            error_msg =f"Error saving preset: {str(e)}"
-            print (f"❌ {error_msg}")
-            import traceback 
-            traceback .print_exc ()
-            
-            return (
-            gr .Dropdown (choices =get_preset_choices_for_ui ()),# preset_dropdown 
-            f"❌ {error_msg}",# preset_message_text 
-            "❌ Error in preset system",# preset_status_text 
-            gr .Textbox (value =preset_name ),# preset_name_input 
-            gr .Textbox (value =preset_description )# preset_description_input 
-            )
-
-    def load_preset_ui_handler (selected_preset ):
-        """Handle loading a preset from the UI with enhanced feedback"""
-        try :
-            # Check if preset is selected
-            if not selected_preset or selected_preset .strip ()=="":
-                return (
-                gr .Dropdown (choices =get_preset_choices_for_ui ()),
-                "⚠️ No preset selected",
-                get_preset_status_for_ui (),
-                # Keep current parameter values (no change)
-                gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),
-                gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),
-                gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),gr .update ()
-                )
-            
-            print (f"🔄 Loading preset '{selected_preset}'...")
-            
-            success ,message ,updated_presets ,current_preset ,ui_values =load_preset_for_ui (selected_preset )
-            
-            if success :
-                # Format success message with parameter info
-                param_info =f"Parameters: seed={ui_values[0]}, quality={ui_values[1]:.1f}"
-                status_msg =f"✅ {message}"
-                print (f"✅ Loaded preset '{selected_preset}' successfully ({param_info})")
-                
-                # Log parameter changes for debugging
-                print (f"   Applied parameters:")
-                print (f"     Seed: {ui_values[0]}")
-                print (f"     SS Guidance: {ui_values[1]}, Steps: {ui_values[2]}")
-                print (f"     SLAT Guidance: {ui_values[3]}, Steps: {ui_values[4]}")
-                print (f"     Polygon %: {ui_values[5]:.2f}")
-                print (f"     UV Resolution: {ui_values[8]}")
-                
-            else :
-                status_msg =f"❌ {message}"
-                print (f"❌ Failed to load preset '{selected_preset}': {message}")
-            
-            # ui_values contains all parameter values in this order:
-            # (seed, ss_guidance_strength, ss_sampling_steps, slat_guidance_strength, slat_sampling_steps,
-            #  poly_count_pcnt, xatlas_max_cost, xatlas_normal_seam_weight, xatlas_resolution, xatlas_padding,
-            #  normal_map_resolution, normal_match_input_resolution, auto_save_obj, auto_save_glb, auto_save_ply, auto_save_stl)
-            
-            return (
-            gr .Dropdown (choices =updated_presets ,value =current_preset ),# preset_dropdown 
-            status_msg ,# preset_message_text 
-            get_preset_status_for_ui (),# preset_status_text 
-            # All parameter controls:
-            ui_values [0 ],# seed 
-            ui_values [1 ],# ss_guidance_strength 
-            ui_values [2 ],# ss_sampling_steps 
-            ui_values [3 ],# slat_guidance_strength 
-            ui_values [4 ],# slat_sampling_steps 
-            ui_values [5 ],# poly_count_pcnt 
-            ui_values [6 ],# xatlas_max_cost 
-            ui_values [7 ],# xatlas_normal_seam_weight 
-            ui_values [8 ],# xatlas_resolution 
-            ui_values [9 ],# xatlas_padding 
-            ui_values [10 ],# normal_map_resolution 
-            ui_values [11 ],# normal_match_input_resolution 
-            ui_values [12 ],# auto_save_obj 
-            ui_values [13 ],# auto_save_glb 
-            ui_values [14 ],# auto_save_ply 
-            ui_values [15 ]# auto_save_stl 
-            )
-            
-        except Exception as e :
-            error_msg =f"Error loading preset: {str(e)}"
-            print (f"❌ {error_msg}")
-            import traceback 
-            traceback .print_exc ()
-            
-            # Return current state with error message
-            return (
-            gr .Dropdown (choices =get_preset_choices_for_ui ()),# preset_dropdown 
-            f"❌ {error_msg}",# preset_message_text 
-            "❌ Error in preset system",# preset_status_text 
-            # Keep current parameter values (no change)
-            gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),
-            gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),
-            gr .update (),gr .update (),gr .update (),gr .update (),gr .update (),gr .update ()
-            )
-
-    def delete_preset_ui_handler (selected_preset ):
-        """Handle deleting a preset from the UI"""
-        try :
-            if not selected_preset or selected_preset .strip ()=="":
-                return (
-                gr .Dropdown (choices =get_preset_choices_for_ui ()),
-                "❌ No preset selected for deletion",
-                get_preset_status_for_ui ()
-                )
-            
-            success ,message ,updated_presets ,current_preset =delete_preset_from_ui (selected_preset )
-            
-            if success :
-                status_msg =f"✅ {message}"
-                print (f"✅ Deleted preset '{selected_preset}' successfully")
-            else :
-                status_msg =f"❌ {message}"
-                print (f"❌ Failed to delete preset '{selected_preset}': {message}")
-            
-            return (
-            gr .Dropdown (choices =updated_presets ,value =current_preset ),# preset_dropdown 
-            status_msg ,# preset_message_text 
-            get_preset_status_for_ui ()# preset_status_text 
-            )
-            
-        except Exception as e :
-            error_msg =f"Error deleting preset: {str(e)}"
-            print (f"❌ {error_msg}")
-            import traceback 
-            traceback .print_exc ()
-            
-            return (
-            gr .Dropdown (choices =get_preset_choices_for_ui ()),
-            f"❌ {error_msg}",
-            "❌ Error in preset system"
-            )
-
-    def initialize_preset_ui ():
-        """Initialize preset UI on app startup"""
-        try :
-            print ("🔧 Initializing preset UI...")
-            
-            # Initialize file system first
-            file_success ,file_message =initialize_preset_file_system ()
-            if not file_success :
-                print (f"⚠️ Preset file system initialization failed: {file_message}")
-            
-            # Initialize preset system
-            success ,message ,preset_list ,selected_preset ,ui_values =initialize_presets_for_ui ()
-            
-            if success :
-                status_msg =f"✅ {message}"
-                print (f"✅ Preset system initialized: {len(preset_list)} presets available")
-            else :
-                status_msg =f"❌ {message}"
-                print (f"❌ Preset system initialization failed: {message}")
-                # Use fallback values
-                preset_list =["Default"]
-                selected_preset ="Default"
-                ui_values =(
-                -1 ,3.0 ,50 ,3.0 ,6 ,0.5 ,8.0 ,1.0 ,1024 ,2 ,768 ,True ,True ,True ,True ,True 
-                )
-            
-            return (
-            gr .Dropdown (choices =preset_list ,value =selected_preset ),# preset_dropdown 
-            f"Preset system ready",# preset_message_text 
-            get_preset_status_for_ui (),# preset_status_text 
-            # All parameter controls:
-            ui_values [0 ],# seed 
-            ui_values [1 ],# ss_guidance_strength 
-            ui_values [2 ],# ss_sampling_steps 
-            ui_values [3 ],# slat_guidance_strength 
-            ui_values [4 ],# slat_sampling_steps 
-            ui_values [5 ],# poly_count_pcnt 
-            ui_values [6 ],# xatlas_max_cost 
-            ui_values [7 ],# xatlas_normal_seam_weight 
-            ui_values [8 ],# xatlas_resolution 
-            ui_values [9 ],# xatlas_padding 
-            ui_values [10 ],# normal_map_resolution 
-            ui_values [11 ],# normal_match_input_resolution 
-            ui_values [12 ],# auto_save_obj 
-            ui_values [13 ],# auto_save_glb 
-            ui_values [14 ],# auto_save_ply 
-            ui_values [15 ]# auto_save_stl 
-            )
-            
-        except Exception as e :
-            error_msg =f"Critical error initializing preset UI: {str(e)}"
-            print (f"❌ {error_msg}")
-            import traceback 
-            traceback .print_exc ()
-            
-            # Emergency fallback
-            return (
-            gr .Dropdown (choices =["Default"],value ="Default"),
-            f"❌ Preset system error: {str(e)}",
-            "❌ Preset system failed",
-            # Default parameter values
-            -1 ,3.0 ,50 ,3.0 ,6 ,0.5 ,8.0 ,1.0 ,1024 ,2 ,768 ,True ,True ,True ,True ,True 
-            )
-
-    def validate_system_integration ():
-
-        try :
-            return get_comprehensive_status_summary (
-            processing_core =processing_core ,
-            batch_processor =batch_processor ,
-            hi3dgen_pipeline =hi3dgen_pipeline ,
-            weights_dir =WEIGHTS_DIR ,
-            tmp_dir =TMP_DIR 
-            )
-        except Exception as e :
-            return f"❌ Validation error: {str(e)}"
-
-    def start_batch_processing_ui (input_folder ,output_folder ,skip_existing ,use_current_settings ,
-    seed ,ss_guidance_strength ,ss_sampling_steps ,
-    slat_guidance_strength ,slat_sampling_steps ,poly_count_pcnt ,
-    xatlas_max_cost ,xatlas_normal_seam_weight ,xatlas_resolution ,xatlas_padding ,
-    normal_map_resolution ,normal_match_input_resolution ,
-    auto_save_obj ,auto_save_glb ,auto_save_ply ,auto_save_stl ,
-    progress =gr .Progress ()):
-
-        global batch_processor 
-
-        if not batch_processor :
-            return ("Error: Batch processor not initialized","Failed","No batch processor available",
-            gr .Button (visible =True ),gr .Button (visible =False ))
-
-        if not input_folder or not output_folder :
-            return ("Error: Please specify both input and output folders","Failed","Missing folder paths",
-            gr .Button (visible =False ),gr .Button (visible =False ))
-
-        if not os .path .exists (input_folder ):
-            return (f"Error: Input folder does not exist: {input_folder}","Failed","Invalid input folder",
-            gr .Button (visible =True ),gr .Button (visible =False ))
-
-        try :
-
-            def batch_progress_callback (batch_progress ):
-
-                try :
-                    if batch_progress .total_images >0 :
-                        percentage =batch_progress .progress_percentage /100.0 
-                        current_stage =batch_progress .current_stage 
-
-                        progress (percentage ,desc =f"{current_stage} ({batch_progress.processed_images}/{batch_progress.total_images})")
-
-                        if batch_progress .current_image :
-                            eta_text =""
-                            if batch_progress .estimated_time_remaining >0 :
-                                eta_minutes =batch_progress .estimated_time_remaining /60 
-                                if eta_minutes >1 :
-                                    eta_text =f", ETA: {eta_minutes:.1f}min"
-                                else :
-                                    eta_text =f", ETA: {batch_progress.estimated_time_remaining:.0f}s"
-
-                            print (f"Batch Progress: {current_stage} - {batch_progress.processed_images}/{batch_progress.total_images} ({batch_progress.progress_percentage:.1f}%{eta_text})")
-                    else :
-                        progress (0.0 ,desc =batch_progress .current_stage )
-
-                except Exception as e :
-                    print (f"Error in batch progress callback: {e}")
-
-            batch_processor .set_progress_callback (batch_progress_callback )
-
-            settings =BatchSettings (
-            input_folder =input_folder ,
-            output_folder =output_folder ,
-            skip_existing =skip_existing ,
-            seed =seed if use_current_settings else -1 ,
-            ss_guidance_strength =ss_guidance_strength if use_current_settings else 3.0 ,
-            ss_sampling_steps =ss_sampling_steps if use_current_settings else 50 ,
-            slat_guidance_strength =slat_guidance_strength if use_current_settings else 3.0 ,
-            slat_sampling_steps =slat_sampling_steps if use_current_settings else 6 ,
-            poly_count_pcnt =poly_count_pcnt if use_current_settings else 0.5 ,
-            xatlas_max_cost =xatlas_max_cost if use_current_settings else 8.0 ,
-            xatlas_normal_seam_weight =xatlas_normal_seam_weight if use_current_settings else 1.0 ,
-            xatlas_resolution =xatlas_resolution if use_current_settings else 1024 ,
-            xatlas_padding =xatlas_padding if use_current_settings else 2 ,
-            normal_map_resolution =normal_map_resolution if use_current_settings else 768 ,
-            normal_match_input_resolution =normal_match_input_resolution if use_current_settings else True ,
-            auto_save_obj =auto_save_obj if use_current_settings else True ,
-            auto_save_glb =auto_save_glb if use_current_settings else True ,
-            auto_save_ply =auto_save_ply if use_current_settings else True ,
-            auto_save_stl =auto_save_stl if use_current_settings else True 
-            )
-
-            print (f"Starting batch processing:")
-            print (f"  Input folder: {input_folder}")
-            print (f"  Output folder: {output_folder}")
-            print (f"  Skip existing: {skip_existing}")
-            print (f"  Use current settings: {use_current_settings}")
-
-            progress (0.0 ,desc ="Initializing batch processing...")
-
-            def run_batch ():
-                try :
-                    print ("Starting batch processing thread...")
-                    result =batch_processor .start_batch_processing (settings )
-
-                    if result .processed_images >0 :
-                        success_rate =(result .processed_images /(result .processed_images +len (result .errors )))*100 if (result .processed_images +len (result .errors ))>0 else 0 
-                        progress (1.0 ,desc =f"✅ Completed: {result.processed_images} processed, {len(result.errors)} errors ({success_rate:.1f}% success)")
-                    else :
-                        progress (0.0 ,desc ="⚠️ No images processed")
-
-                    print (f"Batch processing completed: {result.processed_images} processed, {len(result.errors)} errors")
-
-                    if result .processed_images >0 :
-                        print (f"✅ Successfully processed {result.processed_images} images")
-                    if len (result .errors )>0 :
-                        print (f"❌ {len(result.errors)} images failed processing:")
-                        for error in result .errors [:5 ]:
-                            print (f"  • {error}")
-                        if len (result .errors )>5 :
-                            print (f"  • ... and {len(result.errors) - 5} more errors")
-                    if len (result .skipped )>0 :
-                        print (f"⏭️ Skipped {len(result.skipped)} existing files")
-
-                except Exception as e :
-                    progress (0.0 ,desc =f"Error: {str(e)}")
-                    print (f"Batch processing error: {e}")
-                    import traceback 
-                    traceback .print_exc ()
-
-            batch_thread =threading .Thread (target =run_batch ,daemon =True )
-            batch_thread .start ()
-
-            return ("Batch processing started...","Running","Initializing batch processing...",
-            gr .Button (visible =False ),gr .Button (visible =True ))
-
-        except Exception as e :
-            error_msg =f"Error starting batch processing: {str(e)}"
-            print (error_msg )
-            import traceback 
-            traceback .print_exc ()
-            progress (0.0 ,desc =f"Failed: {str(e)}")
-            return (error_msg ,"Failed","Error occurred",
-            gr .Button (visible =False ),gr .Button (visible =False ))
-
-    def cancel_processing_ui ():
-
-        try :
-            success =request_cancellation ("User requested cancellation")
-            if success :
-                return ("Cancellation requested...","Cancelling","Processing will stop soon...",
-                gr .Button (visible =True ),gr .Button (visible =False ))
-            else :
-                return ("No active processing to cancel","Idle","Ready",
-                gr .Button (visible =True ),gr .Button (visible =False ))
-        except Exception as e :
-            error_msg =f"Error requesting cancellation: {str(e)}"
-            print (error_msg )
-            return (error_msg ,"Error","Cancellation failed",
-            gr .Button (visible =True ),gr .Button (visible =False ))
-
-    def update_processing_status ():
-
-        try :
-            global_status =get_status_summary ()
-
-            if batch_processor and hasattr (batch_processor ,'get_status_summary'):
-                try :
-                    batch_status =batch_processor .get_status_summary ()
-                    batch_progress =batch_processor .progress 
-
-                    if hasattr (batch_progress ,'total_images')and batch_progress .total_images >0 :
-
-                        percentage =getattr (batch_progress ,'progress_percentage',0 )
-                        elapsed =getattr (batch_progress ,'elapsed_time',0 )
-                        eta =getattr (batch_progress ,'estimated_time_remaining',0 )
-
-                        results_summary =f"📊 Batch Progress Summary\n"
-                        results_summary +=f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        results_summary +=f"📁 Total Images: {batch_progress.total_images}\n"
-                        results_summary +=f"✅ Processed: {batch_progress.processed_images}\n"
-                        results_summary +=f"⏭️ Skipped: {len(getattr(batch_progress, 'skipped', []))}\n"
-                        results_summary +=f"❌ Errors: {len(getattr(batch_progress, 'errors', []))}\n"
-                        results_summary +=f"📈 Progress: {percentage:.1f}%\n"
-                        results_summary +=f"⏱️ Elapsed: {elapsed:.1f}s"
-
-                        if eta >0 :
-                            eta_text =f"{eta/60:.1f}min"if eta >60 else f"{eta:.0f}s"
-                            results_summary +=f" | ETA: {eta_text}"
-
-                        current_image =getattr (batch_progress ,'current_image',None )
-                        if current_image :
-                            results_summary +=f"\n🔄 Current: {current_image}"
-
-                        errors =getattr (batch_progress ,'errors',[])
-                        if errors :
-                            results_summary +=f"\n\n❌ Recent Errors:"
-                            for error in errors [-3 :]:
-                                results_summary +=f"\n  • {error}"
-
-                        skipped =getattr (batch_progress ,'skipped',[])
-                        if skipped and len (skipped )<=5 :
-                            results_summary +=f"\n\n⏭️ Skipped Files:"
-                            for skip in skipped :
-                                results_summary +=f"\n  • {skip}"
-                        elif len (skipped )>5 :
-                            results_summary +=f"\n\n⏭️ Skipped Files: {len(skipped)} files (check console for details)"
-
-                    else :
-                        results_summary ="🚀 Ready for batch processing\n"
-                        results_summary +="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        results_summary +="Select input and output folders to begin"
-
-                    is_running =getattr (batch_processor ,'is_running',False )
-                    if is_running :
-                        if hasattr (batch_progress ,'total_images')and batch_progress .total_images >0 :
-                            detailed_status =f"🔄 {batch_status}\n"
-                            detailed_status +=f"Processing: {batch_progress.processed_images}/{batch_progress.total_images} images"
-                            current_image =getattr (batch_progress ,'current_image',None )
-                            if current_image :
-                                detailed_status +=f"\nCurrent: {current_image}"
-                        else :
-                            detailed_status =f"🔄 {batch_status}"
-                    else :
-                        detailed_status =f"⏸️ {batch_status}"
-
-                    show_cancel =is_running or "processing"in global_status .lower ()
-
-                    return (global_status ,detailed_status ,results_summary ,
-                    gr .Button (visible =show_cancel ),gr .Button (visible =not show_cancel ))
-
-                except Exception as batch_e :
-                    print (f"⚠️ Batch processor status error: {batch_e}")
-
-                    show_cancel ="processing"in global_status .lower ()
-                    return (global_status ,"⚠️ Batch processor status unavailable","Batch processor initialized but status unavailable",
-                    gr .Button (visible =show_cancel ),gr .Button (visible =not show_cancel ))
-            else :
-                show_cancel ="processing"in global_status .lower ()
-                return (global_status ,"❌ Batch processor not available","⚠️ Batch processor not initialized",
-                gr .Button (visible =show_cancel ),gr .Button (visible =not show_cancel ))
-
-        except Exception as e :
-            error_msg =f"❌ Error updating status: {str(e)}"
-            print (error_msg )
-            import traceback 
-            traceback .print_exc ()
-            return (error_msg ,"❌ Status Error","Status update failed - check console",
-            gr .Button (visible =False ),gr .Button (visible =False ))
-
-    batch_start_btn .click (
-    fn =start_batch_processing_ui ,
-    inputs =[
-    batch_input_folder ,batch_output_folder ,batch_skip_existing ,batch_use_current_settings ,
-    seed ,ss_guidance_strength ,ss_sampling_steps ,
-    slat_guidance_strength ,slat_sampling_steps ,poly_count_slider ,
-    xatlas_max_cost_slider ,xatlas_normal_seam_weight_slider ,xatlas_resolution_slider ,xatlas_padding_slider ,
-    normal_map_resolution_slider ,normal_match_input_res_checkbox ,
-    auto_save_obj_cb ,auto_save_glb_cb ,auto_save_ply_cb ,auto_save_stl_cb 
-    ],
-    outputs =[processing_status_text ,batch_status_text ,batch_results_text ,batch_start_btn ,universal_cancel_btn ],
-    show_progress =True 
-    )
-
-    universal_cancel_btn .click (
-    fn =cancel_processing_ui ,
-    inputs =[],
-    outputs =[processing_status_text ,batch_status_text ,batch_results_text ,batch_start_btn ,universal_cancel_btn ]
-    )
-
-    batch_cancel_btn .click (
-    fn =cancel_processing_ui ,
-    inputs =[],
-    outputs =[processing_status_text ,batch_status_text ,batch_results_text ,batch_start_btn ,universal_cancel_btn ]
-    )
-
-    demo .load (
-    fn =update_processing_status ,
-    inputs =[],
-    outputs =[processing_status_text ,batch_status_text ,batch_results_text ,universal_cancel_btn ,batch_start_btn ]
-    )
-
-    demo .load (
-    fn =lambda :print (validate_system_integration ()),
-    inputs =[],
-    outputs =[]
-    )
-
-    # Preset Management Event Handlers
-    save_preset_btn .click (
-    fn =save_preset_ui_handler ,
-    inputs =[
-    preset_name_input ,preset_description_input ,
-    seed ,ss_guidance_strength ,ss_sampling_steps ,
-    slat_guidance_strength ,slat_sampling_steps ,poly_count_slider ,
-    xatlas_max_cost_slider ,xatlas_normal_seam_weight_slider ,xatlas_resolution_slider ,xatlas_padding_slider ,
-    normal_map_resolution_slider ,normal_match_input_res_checkbox ,
-    auto_save_obj_cb ,auto_save_glb_cb ,auto_save_ply_cb ,auto_save_stl_cb 
-    ],
-    outputs =[
-    preset_dropdown ,preset_message_text ,preset_status_text ,
-    preset_name_input ,preset_description_input 
-    ]
-    )
-
-    load_preset_btn .click (
-    fn =load_preset_ui_handler ,
-    inputs =[preset_dropdown ],
-    outputs =[
-    preset_dropdown ,preset_message_text ,preset_status_text ,
-    # All parameter controls need to be updated when loading preset:
-    seed ,ss_guidance_strength ,ss_sampling_steps ,
-    slat_guidance_strength ,slat_sampling_steps ,poly_count_slider ,
-    xatlas_max_cost_slider ,xatlas_normal_seam_weight_slider ,xatlas_resolution_slider ,xatlas_padding_slider ,
-    normal_map_resolution_slider ,normal_match_input_res_checkbox ,
-    auto_save_obj_cb ,auto_save_glb_cb ,auto_save_ply_cb ,auto_save_stl_cb 
-    ]
-    )
-
-    delete_preset_btn .click (
-    fn =delete_preset_ui_handler ,
-    inputs =[preset_dropdown ],
-    outputs =[preset_dropdown ,preset_message_text ,preset_status_text ]
-    )
-
-    # Also handle dropdown change to load preset when user selects from dropdown
-    preset_dropdown .change (
-    fn =load_preset_ui_handler ,
-    inputs =[preset_dropdown ],
-    outputs =[
-    preset_dropdown ,preset_message_text ,preset_status_text ,
-    # All parameter controls:
-    seed ,ss_guidance_strength ,ss_sampling_steps ,
-    slat_guidance_strength ,slat_sampling_steps ,poly_count_slider ,
-    xatlas_max_cost_slider ,xatlas_normal_seam_weight_slider ,xatlas_resolution_slider ,xatlas_padding_slider ,
-    normal_map_resolution_slider ,normal_match_input_res_checkbox ,
-    auto_save_obj_cb ,auto_save_glb_cb ,auto_save_ply_cb ,auto_save_stl_cb 
-    ]
-    )
-
-    # Initialize preset system on app load
-    demo .load (
-    fn =initialize_preset_ui ,
-    inputs =[],
-    outputs =[
-    preset_dropdown ,preset_message_text ,preset_status_text ,
-    # All parameter controls to set initial values:
-    seed ,ss_guidance_strength ,ss_sampling_steps ,
-    slat_guidance_strength ,slat_sampling_steps ,poly_count_slider ,
-    xatlas_max_cost_slider ,xatlas_normal_seam_weight_slider ,xatlas_resolution_slider ,xatlas_padding_slider ,
-    normal_map_resolution_slider ,normal_match_input_res_checkbox ,
-    auto_save_obj_cb ,auto_save_glb_cb ,auto_save_ply_cb ,auto_save_stl_cb 
-    ]
-    )
-
-    def cleanup_processing_system ():
-
-        global processing_core ,batch_processor ,cancellation_manager ,hi3dgen_pipeline 
-
-        try :
-            print ("🧹 Cleaning up processing system...")
-
-            if cancellation_manager :
-                try :
-                    cancellation_manager .request_cancellation ("System shutdown")
-                    print ("  ✓ Cancellation requested")
-                except Exception as e :
-                    print (f"  ⚠️ Error during cancellation: {e}")
-
-            if batch_processor and hasattr (batch_processor ,'cleanup'):
-                try :
-                    batch_processor .cleanup ()
-                    print ("  ✓ Batch processor cleaned up")
-                except Exception as e :
-                    print (f"  ⚠️ Error cleaning batch processor: {e}")
-
-            if processing_core and hasattr (processing_core ,'cleanup'):
-                try :
-                    processing_core .cleanup ()
-                    print ("  ✓ Processing core cleaned up")
-                except Exception as e :
-                    print (f"  ⚠️ Error cleaning processing core: {e}")
-
-            if hi3dgen_pipeline :
-                try :
-
-                    if torch .cuda .is_available ():
-                        torch .cuda .synchronize ()
-
-                    if hasattr (hi3dgen_pipeline ,'reset_birefnet_state'):
-                        hi3dgen_pipeline .reset_birefnet_state ()
-                        print ("  ✓ BiRefNet state reset")
-
-                    hi3dgen_pipeline .cpu ()
-
-                    if torch .cuda .is_available ():
-                        torch .cuda .empty_cache ()
-
-                    print ("  ✓ GPU memory cleared")
-
-                except RuntimeError as cuda_error :
-                    if "CUDA"in str (cuda_error ):
-                        print (f"  ⚠️ CUDA error during cleanup: {cuda_error}")
-                        print ("  ⚠️ Attempting force GPU cleanup...")
-                        try :
-
-                            if hasattr (hi3dgen_pipeline ,'reset_birefnet_state'):
-                                hi3dgen_pipeline .reset_birefnet_state ()
-
-                            if torch .cuda .is_available ():
-                                torch .cuda .empty_cache ()
-                                torch .cuda .synchronize ()
-                            print ("  ✓ Force GPU cleanup completed")
-                        except Exception as force_error :
-                            print (f"  ❌ Force GPU cleanup also failed: {force_error}")
-                    else :
-                        print (f"  ⚠️ Non-CUDA error during GPU cleanup: {cuda_error}")
-                except Exception as e :
-                    print (f"  ⚠️ Unexpected error clearing GPU memory: {e}")
-
-                    try :
-                        if hasattr (hi3dgen_pipeline ,'reset_birefnet_state'):
-                            hi3dgen_pipeline .reset_birefnet_state ()
-                        if torch .cuda .is_available ():
-                            torch .cuda .empty_cache ()
-                    except :
-                        pass 
-
-            print ("🧹 Cleanup completed")
-
-        except Exception as e :
-            print (f"❌ Error during cleanup: {e}")
-            import traceback 
-            traceback .print_exc ()
-
-    import atexit 
-    atexit .register (cleanup_processing_system )
-
-if __name__ =="__main__":
-
-    print ("Verifying model weights...")
-    cached_paths =verify_weights (WEIGHTS_DIR )
-
-    global_cached_paths =cached_paths 
-
-    expected_models =[
-    "models--Stable-X--trellis-normal-v0-1",
-    "models--Stable-X--yoso-normal-v1-8-1",
-    "models--ZhengPeng7--BiRefNet"
-    ]
-
-    print ("Verifying cached models...")
-    for model_name in expected_models :
-        model_path =os .path .join (WEIGHTS_DIR ,model_name )
-        if os .path .exists (model_path ):
-            print (f"✓ Found: {model_name}")
-        else :
-            print (f"✗ Missing: {model_name}")
-
-    print ("Loading Hi3DGenPipeline to CPU...")
-
-    trellis_local_path =os .path .join (WEIGHTS_DIR ,"models--Stable-X--trellis-normal-v0-1")
-    hi3dgen_pipeline =Hi3DGenPipeline .from_pretrained (trellis_local_path )
-    hi3dgen_pipeline .cpu ()
-    print ("Hi3DGenPipeline loaded on CPU.")
-
-    print ("Initializing processing system...")
-    print (f"  System Info:")
-    print (f"    - WEIGHTS_DIR: {WEIGHTS_DIR}")
-    print (f"    - TMP_DIR: {TMP_DIR}")
-    print (f"    - MAX_SEED: {MAX_SEED}")
-    print (f"    - CUDA Available: {torch.cuda.is_available()}")
-    if torch .cuda .is_available ():
-        print (f"    - CUDA Device: {torch.cuda.get_device_name()}")
-        print (f"    - CUDA Memory: {torch.cuda.get_device_properties(0).total_memory // 1024**3} GB")
-
-    try :
-
-        if hi3dgen_pipeline is None :
-            raise RuntimeError ("Hi3DGenPipeline not loaded")
-        if not os .path .exists (WEIGHTS_DIR ):
-            raise RuntimeError (f"Weights directory not found: {WEIGHTS_DIR}")
-        if not os .path .exists (TMP_DIR ):
-            os .makedirs (TMP_DIR ,exist_ok =True )
-            print (f"Created TMP_DIR: {TMP_DIR}")
-
-        processing_core =ProcessingCore (
-        hi3dgen_pipeline =hi3dgen_pipeline ,
-        weights_dir =WEIGHTS_DIR ,
-        tmp_dir =TMP_DIR ,
-        max_seed =MAX_SEED 
-        )
-        print ("✓ ProcessingCore initialized successfully.")
-
-        batch_processor =create_batch_processor (processing_core )
-        print ("✓ BatchProcessor initialized successfully.")
-
-        cancellation_manager =get_cancellation_manager ()
-        print ("✓ Cancellation manager initialized successfully.")
-
-        assert processing_core is not None ,"ProcessingCore initialization failed"
-        assert batch_processor is not None ,"BatchProcessor initialization failed"
-        assert cancellation_manager is not None ,"Cancellation manager initialization failed"
-
-        print ("🚀 Processing system ready and verified!")
-
-        if SYSTEM_STATUS_AVAILABLE :
-            print ("\n"+"="*60 )
-            print_system_status (
-            processing_core =processing_core ,
-            batch_processor =batch_processor ,
-            hi3dgen_pipeline =hi3dgen_pipeline ,
-            weights_dir =WEIGHTS_DIR ,
-            tmp_dir =TMP_DIR 
-            )
-            print ("="*60 )
-        else :
-            print ("\n🚀 System ready with basic monitoring")
-            print (f"✓ ProcessingCore: {'Available' if processing_core else 'Not Available'}")
-            print (f"✓ BatchProcessor: {'Available' if batch_processor else 'Not Available'}")
-            print (f"✓ CancellationManager: {'Available' if cancellation_manager else 'Not Available'}")
-            print (f"✓ Hi3DGen Pipeline: {'Available' if hi3dgen_pipeline else 'Not Available'}")
-            print (f"✓ GPU Support: {'Available' if torch.cuda.is_available() else 'Not Available'}")
-
-    except Exception as e :
-        print (f"❌ Error initializing processing system: {e}")
-        import traceback 
-        traceback .print_exc ()
-        print ("⚠️ Some features may not work properly.")
-
-        processing_core =None 
-        batch_processor =None 
-        cancellation_manager =None 
-
-    parser =argparse .ArgumentParser (description ="Run the Hi3DGen Gradio App.")
-    parser .add_argument ('--share',action ='store_true',help ='Enable Gradio sharing')
-    args =parser .parse_args ()
-
-    demo .launch (share =args .share ,inbrowser =True )
-
+if __name__ == '__main__':
+    sys.exit(main())
