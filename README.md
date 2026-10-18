@@ -26,6 +26,18 @@
 
 Hi3DGen is the newest state of the art image to 3D mesh generation model. In this tutorial I will show you step by step how to install and use this amazing open source AI model to generate the very best 3D meshes from static images and use in your projects.
 
+## What is new in V18
+
+**Stack:** Python 3.12, CUDA 13, torch 2.13, Gradio 6.30, transformers 5, diffusers 0.41, numpy 2.5. One `requirements.txt` does the whole installation. StableNormal and BiRefNet ship with the app (`third_party/StableNormal`, `hi3dgen/third_party/birefnet`): they no longer depend on remote code, other repositories or the network, and all models are downloaded once by the installer.
+
+**Interface:** colored buttons and a light/dark switch like the other SECourses apps; a live status card with progress, the seed that was used and the timing of every stage; the normal map appears as soon as it exists and the 3D mesh is shown while the UV unwrapping is still running; **Cancel works for a single image, several views and batch** (also in the middle of the UV unwrapping); the display mode and the download format follow what you choose; Performance section with the model memory mode, a *Free GPU memory* button and the number of meshes a batch unwraps at the same time.
+
+**Speed:** the models stay on the GPU between generations when the card has 20 GB or more (*Performance → Model memory*: auto / keep / offload), StableNormal is loaded once instead of for every image, and decimation and UV unwrapping run in a worker process. That keeps the page responsive during the minute they take and lets a batch work on the next image on the GPU while the previous meshes are unwrapped: a batch is two to three times faster, with the same results.
+
+**Same results as V17:** the background masks are pixel identical, the normal maps match at 63 dB PSNR, the meshes agree to within 0.2 % of the model size (the generation is not bit exact between library versions), and the CPU stages (decimation, UV unwrapping, exports) produce identical meshes. `python tools/self_check.py` checks the whole installation, `python tools/golden_check.py run --out runs/x` runs the real pipeline on example images and `compare` checks two result folders.
+
+**Settings for experts:** environment variables `HI3DGEN_MODEL_MEMORY` (auto/keep/offload), `HI3DGEN_MESH_JOBS` (meshes unwrapped at the same time in a batch), `HI3DGEN_MESH_SUBPROCESS=0` (run the mesh steps inside the app again) and `SPCONV_ALGO` (default `native`). Command line: `python secourses_app.py --port 7861 --no-browser --share --model-memory keep`.
+
 ## Video Chapters
 
 - 0:00 Introducing Hi3DGen: State-of-the-Art Image-to-3D Model
