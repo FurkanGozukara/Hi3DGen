@@ -27,7 +27,7 @@ PARAMETER_INFO = {
         "name": "Seed",
         "type": "Slider",
         "range": "-1 to 2,147,483,647",
-        "default": "0",
+        "default": "-1 (random)",
         "description": "Controls randomness in the generation process",
         "details": """
         **Purpose**: Determines the random number generation seed for reproducible results.

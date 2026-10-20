@@ -142,7 +142,7 @@ _BASE_CSS = r"""
 .progress-fill { height: 100%; border-radius: var(--radius-full); background: linear-gradient(90deg, #2563eb, #14b8a6, #22c55e); transition: width 250ms ease; }
 .progress-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 128px), 1fr)); gap: var(--size-2); margin-top: var(--size-3); }
 .progress-metric { min-width: 0; }
-.progress-metric strong { display: block; font-size: var(--text-xs); font-weight: 600; letter-spacing: .04em; color: var(--body-text-color-subdued); }
+.progress-metric strong { display: block; font-size: var(--text-xs); font-weight: 600; letter-spacing: .04em; color: var(--body-text-color-subdued); overflow-wrap: anywhere; }
 .progress-metric span { display: block; margin-top: 2px; font-size: var(--text-md); font-weight: 700; color: var(--body-text-color); overflow-wrap: anywhere; }
 .status-ok { color: var(--ax-ok); font-weight: 700; }
 .status-warn { color: var(--ax-warn); font-weight: 700; }
@@ -150,9 +150,9 @@ _BASE_CSS = r"""
 .summary-strip { padding: var(--size-2) var(--size-3); border-left: 4px solid var(--ax-accent); border-radius: var(--radius-sm); background: var(--background-fill-secondary); font-size: var(--text-sm); color: var(--body-text-color-subdued); }
 @keyframes ax-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.8); } }
 
-/* Parameter guide tab */
+/* Parameter guide tab: an 80vh panel whose content scrolls inside it (without the scroll the guide spilled over the settings below) */
 #parameter-guide-content { width: 100% !important; height: 80vh !important; max-width: none !important; max-height: none !important; }
-#parameter-guide-content > div { width: 100% !important; height: 100% !important; max-width: none !important; }
+#parameter-guide-content > div { width: 100% !important; height: 100% !important; max-width: none !important; overflow-y: auto !important; }
 .parameter-guide-tab { width: 100% !important; height: 100% !important; }
 
 .preset-status { min-height: var(--size-6); font-size: var(--text-sm); color: var(--body-text-color-subdued); }

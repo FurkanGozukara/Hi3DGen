@@ -919,7 +919,7 @@ def build_ui() -> gr.Blocks:
                         gr.HTML(value=format_parameter_info_html(), show_label=False, elem_id='parameter-guide-content')
 
                 with gr.Accordion('Advanced Settings', open=True):
-                    seed = gr.Slider(-1, MAX_SEED, label='Seed', value=0, step=1, elem_id='seed',
+                    seed = gr.Slider(-1, MAX_SEED, label='Seed', value=-1, step=1, elem_id='seed',
                                      info='-1 picks a random seed; the seed used is shown after each run.')
                     gr.Markdown('#### Stage 1: Sparse Structure Generation')
                     with gr.Row():
